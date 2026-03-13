@@ -1,0 +1,46 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Runtime data (generated at runtime — do not commit)
+data/
+logs/
+reports/
+
+# Test / debug logs
+*.log
+*.json.bak
+
+# Temp output files from manual test runs
+brainstorm_output*.log
+brainstorm_run*.log
+research_plan_*.json
+research_plan_*.md
+research_plan_*.log
+import_results.py
+
+# Config with potential secrets
+config.toml
+
+# Pytest cache
+.pytest_cache/
+
+# Manual test scripts at project root
+/test_*.py
+
+# Autonomous task tracking (session-specific)
+.autonomous/
+
+# Node
+node_modules/
+
+# IDE
+.vscode/
+.idea/
