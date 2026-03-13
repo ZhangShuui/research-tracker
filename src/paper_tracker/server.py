@@ -15,6 +15,7 @@ from pydantic import BaseModel, field_validator
 
 from paper_tracker import config as cfg_module
 from paper_tracker.brainstorm import run_brainstorm, check_prior_art
+from paper_tracker.chat import generate_chat_response
 from paper_tracker.discovery import run_trending, run_math_insights, run_community_ideas, review_discovery_report
 from paper_tracker.research_plan import generate_research_plan, refine_research_plan
 from paper_tracker.registry import Registry
@@ -50,6 +51,12 @@ async def lifespan(app: FastAPI):
     _scheduler.start()
 
     _maybe_import_legacy(base_cfg)
+
+    # Recover tasks that were stuck in 'running' from a previous crash/restart
+    recovered = _registry.recover_stale_tasks()
+    if recovered:
+        log.warning("Recovered stale tasks on startup: %s", recovered)
+
     log.info("Paper Tracker API started. data_dir=%s", _data_dir)
 
     yield  # ← app runs here
@@ -1065,6 +1072,216 @@ async def refine_plan(topic_id: str, plan_id: str, body: ResearchPlanRefine) -> 
         "status": "started",
         "plan_id": plan_id,
     }
+
+
+# ---------------------------------------------------------------------------
+# Chat endpoints
+# ---------------------------------------------------------------------------
+
+class ChatSessionCreate(BaseModel):
+    title: str = ""
+
+class ChatMessageCreate(BaseModel):
+    content: str
+
+    @field_validator("content")
+    @classmethod
+    def content_not_empty(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("content must not be empty")
+        return v
+
+# In-memory chat progress: assistant_msg_id → {status, content?}
+_chat_progress: dict[str, dict] = {}
+
+
+# In-memory embedding progress: topic_id → {status, embedded, total}
+_embedding_progress: dict[str, dict] = {}
+
+
+@app.post("/api/topics/{topic_id}/embeddings", status_code=202)
+async def build_embeddings(topic_id: str) -> dict:
+    """Build/update the RAG embedding index for a topic's paper library."""
+    from paper_tracker.rag import ensure_embeddings
+
+    reg = _get_registry()
+    if not reg.get_topic(topic_id):
+        raise HTTPException(404, detail="Topic not found")
+
+    if topic_id in _embedding_progress and _embedding_progress[topic_id].get("status") == "running":
+        return _embedding_progress[topic_id]
+
+    _embedding_progress[topic_id] = {"status": "running", "embedded": 0, "total": 0}
+
+    def _run():
+        try:
+            store = Storage(_data_dir, topic_id)
+            try:
+                def _on_progress(done: int, total: int) -> None:
+                    _embedding_progress[topic_id] = {
+                        "status": "running", "embedded": done, "total": total,
+                    }
+
+                count = ensure_embeddings(store, on_progress=_on_progress)
+                existing = store.embedding_count()
+                _embedding_progress[topic_id] = {
+                    "status": "completed", "embedded": count, "total": existing,
+                }
+            finally:
+                store.close()
+        except Exception as e:
+            log.exception("Embedding build failed: %s", e)
+            _embedding_progress[topic_id] = {"status": "failed", "error": str(e)}
+
+    _brainstorm_executor.submit(_run)
+    return {"status": "started", "topic_id": topic_id}
+
+
+@app.get("/api/topics/{topic_id}/embeddings")
+async def get_embeddings_status(topic_id: str) -> dict:
+    """Check embedding index status for a topic."""
+    reg = _get_registry()
+    if not reg.get_topic(topic_id):
+        raise HTTPException(404, detail="Topic not found")
+
+    store = Storage(_data_dir, topic_id)
+    try:
+        total_papers, _ = store.get_all_arxiv(limit=1, offset=0)
+        # get_all_arxiv returns (papers, total)
+        _, paper_count = store.get_all_arxiv(limit=0, offset=0)
+        emb_count = store.embedding_count()
+    finally:
+        store.close()
+
+    progress = _embedding_progress.get(topic_id, {})
+    return {
+        "topic_id": topic_id,
+        "paper_count": paper_count,
+        "embedding_count": emb_count,
+        "indexed": emb_count >= paper_count if paper_count > 0 else False,
+        "progress": progress,
+    }
+
+
+@app.post("/api/topics/{topic_id}/chat", status_code=201)
+async def create_chat_session(topic_id: str, body: ChatSessionCreate) -> dict:
+    reg = _get_registry()
+    if not reg.get_topic(topic_id):
+        raise HTTPException(404, detail="Topic not found")
+    session = reg.create_chat_session(topic_id, title=body.title)
+    return session
+
+
+@app.get("/api/topics/{topic_id}/chat")
+async def list_chat_sessions(topic_id: str) -> dict:
+    reg = _get_registry()
+    if not reg.get_topic(topic_id):
+        raise HTTPException(404, detail="Topic not found")
+    sessions = reg.list_chat_sessions(topic_id)
+    return {"sessions": sessions}
+
+
+@app.get("/api/topics/{topic_id}/chat/{session_id}")
+async def get_chat_session(topic_id: str, session_id: str) -> dict:
+    reg = _get_registry()
+    session = reg.get_chat_session(topic_id, session_id)
+    if not session:
+        raise HTTPException(404, detail="Chat session not found")
+    messages = reg.list_chat_messages(topic_id, session_id)
+    return {**session, "messages": messages}
+
+
+@app.delete("/api/topics/{topic_id}/chat/{session_id}", status_code=204)
+async def delete_chat_session(topic_id: str, session_id: str) -> None:
+    reg = _get_registry()
+    if not reg.delete_chat_session(topic_id, session_id):
+        raise HTTPException(404, detail="Chat session not found")
+
+
+@app.post("/api/topics/{topic_id}/chat/{session_id}/messages", status_code=202)
+async def send_chat_message(topic_id: str, session_id: str, body: ChatMessageCreate) -> dict:
+    reg = _get_registry()
+    topic = reg.get_topic(topic_id)
+    if not topic:
+        raise HTTPException(404, detail="Topic not found")
+    session = reg.get_chat_session(topic_id, session_id)
+    if not session:
+        raise HTTPException(404, detail="Chat session not found")
+
+    # Save user message
+    user_msg = reg.add_chat_message(topic_id, session_id, "user", body.content)
+
+    # Create assistant placeholder
+    assistant_msg = reg.add_chat_message(
+        topic_id, session_id, "assistant", "", status="pending"
+    )
+
+    # Auto-set title from first user message
+    if not session.get("title"):
+        title = body.content[:60].strip()
+        with reg._lock:
+            reg._conn.execute(
+                "UPDATE chat_sessions SET title = ? WHERE id = ?",
+                (title, session_id),
+            )
+            reg._conn.commit()
+
+    topic_cfg = cfg_module.from_topic(topic, _base_cfg)
+    assistant_msg_id = assistant_msg["id"]
+
+    _chat_progress[assistant_msg_id] = {"status": "pending"}
+
+    def _run():
+        try:
+            reg.update_chat_message(assistant_msg_id, {"status": "generating"})
+            _chat_progress[assistant_msg_id] = {"status": "generating"}
+
+            # Get prior messages for context
+            prior = reg.list_chat_messages(topic_id, session_id)
+            # Exclude the pending assistant message itself
+            prior = [m for m in prior if m["id"] != assistant_msg_id]
+
+            result = generate_chat_response(
+                topic_id=topic_id,
+                topic_name=topic["name"],
+                data_dir=_data_dir,
+                cfg=topic_cfg,
+                user_message=body.content,
+                prior_messages=prior,
+            )
+            reg.update_chat_message(assistant_msg_id, {
+                "content": result["content"],
+                "cited_papers": result["cited_papers"],
+                "status": "completed",
+            })
+            _chat_progress[assistant_msg_id] = {"status": "completed"}
+        except Exception as e:
+            log.exception("Chat response generation failed: %s", e)
+            reg.update_chat_message(assistant_msg_id, {
+                "content": "An error occurred while generating the response.",
+                "status": "failed",
+            })
+            _chat_progress[assistant_msg_id] = {"status": "failed"}
+
+    _brainstorm_executor.submit(_run)
+    return {"user_msg_id": user_msg["id"], "assistant_msg_id": assistant_msg_id}
+
+
+@app.get("/api/topics/{topic_id}/chat/{session_id}/messages/{msg_id}/progress")
+async def get_chat_message_progress(topic_id: str, session_id: str, msg_id: str) -> dict:
+    # Check in-memory progress first
+    progress = _chat_progress.get(msg_id)
+    if progress:
+        if progress["status"] in ("completed", "failed"):
+            _chat_progress.pop(msg_id, None)
+        return {"msg_id": msg_id, **progress}
+
+    # Fallback to DB
+    reg = _get_registry()
+    msg = reg.get_chat_message(msg_id)
+    if not msg:
+        raise HTTPException(404, detail="Message not found")
+    return {"msg_id": msg_id, "status": msg["status"]}
 
 
 # ---------------------------------------------------------------------------

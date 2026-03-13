@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import struct
 from pathlib import Path
 
 _SCHEMA = """
@@ -63,6 +64,7 @@ class Storage:
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_SCHEMA)
         self._migrate()
+        self._migrate_embeddings()
 
     def _migrate(self) -> None:
         """Add missing columns to seen_arxiv for older databases."""
@@ -83,6 +85,86 @@ class Storage:
                 "UPDATE seen_arxiv SET paper_id = arxiv_id WHERE paper_id = ''"
             )
         self._conn.commit()
+
+    def _migrate_embeddings(self) -> None:
+        """Create paper_embeddings table if missing."""
+        self._conn.executescript("""
+            CREATE TABLE IF NOT EXISTS paper_embeddings (
+                arxiv_id TEXT PRIMARY KEY,
+                embedding BLOB NOT NULL,
+                model TEXT DEFAULT '',
+                created_at TEXT DEFAULT (datetime('now')),
+                FOREIGN KEY (arxiv_id) REFERENCES seen_arxiv(arxiv_id)
+            );
+        """)
+        self._conn.commit()
+
+    # ---- Embeddings ----
+
+    @staticmethod
+    def _pack_embedding(vec: list[float]) -> bytes:
+        """Pack a float list into a compact binary blob."""
+        return struct.pack(f"{len(vec)}f", *vec)
+
+    @staticmethod
+    def _unpack_embedding(blob: bytes) -> list[float]:
+        """Unpack a binary blob back to a float list."""
+        n = len(blob) // 4
+        return list(struct.unpack(f"{n}f", blob))
+
+    def save_embedding(self, arxiv_id: str, embedding: list[float], model: str = "") -> None:
+        blob = self._pack_embedding(embedding)
+        self._conn.execute(
+            """INSERT OR REPLACE INTO paper_embeddings (arxiv_id, embedding, model)
+               VALUES (?, ?, ?)""",
+            (arxiv_id, blob, model),
+        )
+        self._conn.commit()
+
+    def save_embeddings_batch(self, items: list[tuple[str, list[float], str]]) -> None:
+        """Batch insert: list of (arxiv_id, embedding, model)."""
+        rows = [(aid, self._pack_embedding(emb), m) for aid, emb, m in items]
+        self._conn.executemany(
+            """INSERT OR REPLACE INTO paper_embeddings (arxiv_id, embedding, model)
+               VALUES (?, ?, ?)""",
+            rows,
+        )
+        self._conn.commit()
+
+    def get_embedding(self, arxiv_id: str) -> list[float] | None:
+        row = self._conn.execute(
+            "SELECT embedding FROM paper_embeddings WHERE arxiv_id = ?", (arxiv_id,)
+        ).fetchone()
+        return self._unpack_embedding(row[0]) if row else None
+
+    def get_all_embeddings(self) -> list[tuple[str, list[float]]]:
+        """Return all (arxiv_id, embedding) pairs."""
+        rows = self._conn.execute("SELECT arxiv_id, embedding FROM paper_embeddings").fetchall()
+        return [(r[0], self._unpack_embedding(r[1])) for r in rows]
+
+    def get_papers_without_embeddings(self, limit: int = 200) -> list[dict]:
+        """Return papers that don't have embeddings yet."""
+        rows = self._conn.execute(
+            """SELECT s.* FROM seen_arxiv s
+               LEFT JOIN paper_embeddings e ON s.arxiv_id = e.arxiv_id
+               WHERE e.arxiv_id IS NULL
+               LIMIT ?""",
+            (limit,),
+        ).fetchall()
+        return [self._arxiv_row(r) for r in rows]
+
+    def embedding_count(self) -> int:
+        return self._conn.execute("SELECT COUNT(*) FROM paper_embeddings").fetchone()[0]
+
+    def delete_embedding(self, arxiv_id: str) -> None:
+        self._conn.execute("DELETE FROM paper_embeddings WHERE arxiv_id = ?", (arxiv_id,))
+        self._conn.commit()
+
+    def clear_all_embeddings(self) -> int:
+        """Delete all embeddings (e.g. after model change). Returns count deleted."""
+        cur = self._conn.execute("DELETE FROM paper_embeddings")
+        self._conn.commit()
+        return cur.rowcount
 
     # ---- arXiv ----
 

@@ -114,6 +114,7 @@ class Registry:
         self._migrate_brainstorm_review()
         self._migrate_topic_sources()
         self._migrate_research_plan_history()
+        self._migrate_chat_tables()
         self._lock = threading.Lock()
 
     def _migrate_discovery_quality(self) -> None:
@@ -138,6 +139,33 @@ class Registry:
         if "review_history" not in cols:
             self._conn.execute("ALTER TABLE research_plans ADD COLUMN review_history TEXT DEFAULT '[]'")
             self._conn.commit()
+
+    def _migrate_chat_tables(self) -> None:
+        """Create chat_sessions and chat_messages tables if missing."""
+        self._conn.executescript("""
+            CREATE TABLE IF NOT EXISTS chat_sessions (
+                id TEXT PRIMARY KEY,
+                topic_id TEXT NOT NULL,
+                title TEXT DEFAULT '',
+                status TEXT DEFAULT 'active',
+                created_at TEXT,
+                updated_at TEXT,
+                message_count INTEGER DEFAULT 0,
+                FOREIGN KEY (topic_id) REFERENCES topics(id)
+            );
+            CREATE TABLE IF NOT EXISTS chat_messages (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                topic_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                cited_papers TEXT DEFAULT '[]',
+                status TEXT DEFAULT 'completed',
+                created_at TEXT,
+                FOREIGN KEY (session_id) REFERENCES chat_sessions(id)
+            );
+        """)
+        self._conn.commit()
 
     def _migrate_topic_sources(self) -> None:
         """Add OpenAlex/OpenReview columns to topics if missing."""
@@ -260,6 +288,8 @@ class Registry:
 
     def delete_topic(self, topic_id: str) -> None:
         with self._lock:
+            self._conn.execute("DELETE FROM chat_messages WHERE topic_id = ?", (topic_id,))
+            self._conn.execute("DELETE FROM chat_sessions WHERE topic_id = ?", (topic_id,))
             self._conn.execute("DELETE FROM research_plans WHERE topic_id = ?", (topic_id,))
             self._conn.execute("DELETE FROM brainstorm_sessions WHERE topic_id = ?", (topic_id,))
             self._conn.execute("DELETE FROM sessions WHERE topic_id = ?", (topic_id,))
@@ -555,6 +585,117 @@ class Registry:
                     d[field] = [] if field in ("papers_json", "quality_flags") else {}
         return d
 
+    # ---- Chat Sessions ----
+
+    def create_chat_session(self, topic_id: str, title: str = "") -> dict:
+        import uuid
+        session_id = f"ch-{uuid.uuid4().hex[:8]}"
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock:
+            self._conn.execute(
+                """INSERT INTO chat_sessions (id, topic_id, title, status, created_at, updated_at)
+                   VALUES (?, ?, ?, 'active', ?, ?)""",
+                (session_id, topic_id, title, now, now),
+            )
+            self._conn.commit()
+        return self.get_chat_session(topic_id, session_id)
+
+    def get_chat_session(self, topic_id: str, session_id: str) -> dict | None:
+        row = self._conn.execute(
+            "SELECT * FROM chat_sessions WHERE id = ? AND topic_id = ?",
+            (session_id, topic_id),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def list_chat_sessions(self, topic_id: str, limit: int = 50) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT * FROM chat_sessions WHERE topic_id = ? ORDER BY updated_at DESC LIMIT ?",
+            (topic_id, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def delete_chat_session(self, topic_id: str, session_id: str) -> bool:
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM chat_messages WHERE session_id = ? AND topic_id = ?",
+                (session_id, topic_id),
+            )
+            cur = self._conn.execute(
+                "DELETE FROM chat_sessions WHERE id = ? AND topic_id = ?",
+                (session_id, topic_id),
+            )
+            self._conn.commit()
+            return cur.rowcount > 0
+
+    def add_chat_message(
+        self,
+        topic_id: str,
+        session_id: str,
+        role: str,
+        content: str,
+        cited_papers: list | None = None,
+        status: str = "completed",
+    ) -> dict:
+        import uuid
+        msg_id = f"cm-{uuid.uuid4().hex[:8]}"
+        now = datetime.now(timezone.utc).isoformat()
+        cited_json = json.dumps(cited_papers or [])
+        with self._lock:
+            self._conn.execute(
+                """INSERT INTO chat_messages (id, session_id, topic_id, role, content, cited_papers, status, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (msg_id, session_id, topic_id, role, content, cited_json, status, now),
+            )
+            self._conn.execute(
+                "UPDATE chat_sessions SET message_count = message_count + 1, updated_at = ? WHERE id = ?",
+                (now, session_id),
+            )
+            self._conn.commit()
+        return self.get_chat_message(msg_id)
+
+    def get_chat_message(self, msg_id: str) -> dict | None:
+        row = self._conn.execute(
+            "SELECT * FROM chat_messages WHERE id = ?", (msg_id,)
+        ).fetchone()
+        return self._chat_msg_row(row) if row else None
+
+    def update_chat_message(self, msg_id: str, updates: dict) -> None:
+        allowed = {"content", "cited_papers", "status"}
+        fields = []
+        params = []
+        for key, val in updates.items():
+            if key in allowed:
+                fields.append(f"{key} = ?")
+                if key == "cited_papers" and not isinstance(val, str):
+                    params.append(json.dumps(val))
+                else:
+                    params.append(val)
+        if not fields:
+            return
+        params.append(msg_id)
+        with self._lock:
+            self._conn.execute(
+                f"UPDATE chat_messages SET {', '.join(fields)} WHERE id = ?",
+                params,
+            )
+            self._conn.commit()
+
+    def list_chat_messages(self, topic_id: str, session_id: str, limit: int = 100) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT * FROM chat_messages WHERE session_id = ? AND topic_id = ? ORDER BY created_at ASC LIMIT ?",
+            (session_id, topic_id, limit),
+        ).fetchall()
+        return [self._chat_msg_row(r) for r in rows]
+
+    @staticmethod
+    def _chat_msg_row(row: sqlite3.Row) -> dict:
+        d = dict(row)
+        try:
+            d["cited_papers"] = json.loads(d.get("cited_papers", "[]") or "[]")
+        except (json.JSONDecodeError, TypeError):
+            d["cited_papers"] = []
+        return d
+
     # ---- Translations ----
 
     def get_translation(
@@ -579,6 +720,59 @@ class Registry:
                 (source_type, source_id, field, language, content, now),
             )
             self._conn.commit()
+
+    # ---- Startup recovery ----
+
+    def recover_stale_tasks(self) -> dict[str, int]:
+        """Mark all 'running'/'pending'/'generating' records as 'failed'.
+
+        Should be called once at server startup. Any task that was in a
+        transient state when the previous process died cannot be resumed,
+        so we fail them cleanly.
+
+        Returns a dict of {table: count_recovered}.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        counts: dict[str, int] = {}
+        with self._lock:
+            # sessions
+            cur = self._conn.execute(
+                "UPDATE sessions SET status = 'failed', finished_at = ? WHERE status = 'running'",
+                (now,),
+            )
+            counts["sessions"] = cur.rowcount
+
+            # brainstorm_sessions
+            cur = self._conn.execute(
+                "UPDATE brainstorm_sessions SET status = 'failed', finished_at = ? WHERE status = 'running'",
+                (now,),
+            )
+            counts["brainstorm_sessions"] = cur.rowcount
+
+            # research_plans
+            cur = self._conn.execute(
+                "UPDATE research_plans SET status = 'failed', finished_at = ? WHERE status = 'running'",
+                (now,),
+            )
+            counts["research_plans"] = cur.rowcount
+
+            # discovery_reports
+            cur = self._conn.execute(
+                "UPDATE discovery_reports SET status = 'failed', finished_at = ? WHERE status = 'running'",
+                (now,),
+            )
+            counts["discovery_reports"] = cur.rowcount
+
+            # chat_messages (pending/generating → failed)
+            cur = self._conn.execute(
+                "UPDATE chat_messages SET status = 'failed' WHERE status IN ('pending', 'generating')",
+            )
+            counts["chat_messages"] = cur.rowcount
+
+            self._conn.commit()
+
+        recovered = {k: v for k, v in counts.items() if v > 0}
+        return recovered
 
     # ---- Helpers ----
 

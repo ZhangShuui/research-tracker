@@ -211,6 +211,31 @@ export interface ContextOptions {
   use_novelty_map?: boolean;
 }
 
+export interface ChatSession {
+  id: string;
+  topic_id: string;
+  title: string;
+  status: "active" | "archived";
+  created_at: string;
+  updated_at: string;
+  message_count: number;
+}
+
+export interface ChatMessage {
+  id: string;
+  session_id: string;
+  topic_id: string;
+  role: "user" | "assistant";
+  content: string;
+  cited_papers: { arxiv_id: string; title: string }[];
+  status: "pending" | "generating" | "completed" | "failed";
+  created_at: string;
+}
+
+export interface ChatSessionDetail extends ChatSession {
+  messages: ChatMessage[];
+}
+
 export interface TopicCreate {
   name: string;
   description?: string;
@@ -477,6 +502,48 @@ export const api = {
   ) =>
     req<{ translated: string }>(
       `/api/translate?source_type=${encodeURIComponent(sourceType)}&source_id=${encodeURIComponent(sourceId)}&field=${encodeURIComponent(field)}&language=${encodeURIComponent(language)}`
+    ),
+
+  // --- Embeddings ---
+  buildEmbeddings: (topicId: string) =>
+    req<{ status: string; topic_id: string }>(`/api/topics/${topicId}/embeddings`, {
+      method: "POST",
+    }),
+
+  getEmbeddingsStatus: (topicId: string) =>
+    req<{
+      topic_id: string;
+      paper_count: number;
+      embedding_count: number;
+      indexed: boolean;
+      progress: { status?: string; embedded?: number; total?: number };
+    }>(`/api/topics/${topicId}/embeddings`),
+
+  // --- Chat ---
+  createChatSession: (topicId: string, title = "") =>
+    req<ChatSession>(`/api/topics/${topicId}/chat`, {
+      method: "POST",
+      body: JSON.stringify({ title }),
+    }),
+
+  listChatSessions: (topicId: string) =>
+    req<{ sessions: ChatSession[] }>(`/api/topics/${topicId}/chat`),
+
+  getChatSession: (topicId: string, sessionId: string) =>
+    req<ChatSessionDetail>(`/api/topics/${topicId}/chat/${sessionId}`),
+
+  deleteChatSession: (topicId: string, sessionId: string) =>
+    req<void>(`/api/topics/${topicId}/chat/${sessionId}`, { method: "DELETE" }),
+
+  sendChatMessage: (topicId: string, sessionId: string, content: string) =>
+    req<{ user_msg_id: string; assistant_msg_id: string }>(
+      `/api/topics/${topicId}/chat/${sessionId}/messages`,
+      { method: "POST", body: JSON.stringify({ content }) }
+    ),
+
+  getChatMessageProgress: (topicId: string, sessionId: string, msgId: string) =>
+    req<{ msg_id: string; status: string }>(
+      `/api/topics/${topicId}/chat/${sessionId}/messages/${msgId}/progress`
     ),
 
   // --- Usage ---

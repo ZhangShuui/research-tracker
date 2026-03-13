@@ -21,6 +21,7 @@ const TABS = [
   { label: "Insights", href: "/insights" },
   { label: "Brainstorm", href: "/brainstorm" },
   { label: "Research Plan", href: "/research-plan" },
+  { label: "Chat", href: "/chat" },
 ] as const;
 
 export default function TopicLayout({

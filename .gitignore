@@ -28,6 +28,8 @@ import_results.py
 
 # Config with potential secrets
 config.toml
+.env
+.env.*
 
 # Pytest cache
 .pytest_cache/
