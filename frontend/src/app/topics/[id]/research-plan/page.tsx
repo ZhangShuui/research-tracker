@@ -20,22 +20,26 @@ export default function ResearchPlanPage() {
   const [showAll, setShowAll] = useState(false);
 
   // Check for prefill from brainstorm navigation
-  const prefillIdeaParam = searchParams.get("idea");
+  const fromIdea = searchParams.get("from_idea");
   const prefillBsId = searchParams.get("bs_id");
   const [prefillIdea, setPrefillIdea] = useState<Record<string, unknown> | null>(null);
   const [autoGenerate, setAutoGenerate] = useState(false);
 
   useEffect(() => {
-    if (prefillIdeaParam) {
+    if (fromIdea) {
       try {
-        const idea = JSON.parse(decodeURIComponent(prefillIdeaParam));
-        setPrefillIdea(idea);
-        setAutoGenerate(true);
+        const raw = sessionStorage.getItem("prefill-idea");
+        if (raw) {
+          const idea = JSON.parse(raw);
+          setPrefillIdea(idea);
+          setAutoGenerate(true);
+          sessionStorage.removeItem("prefill-idea");
+        }
       } catch {
-        // ignore invalid param
+        // ignore invalid data
       }
     }
-  }, [prefillIdeaParam]);
+  }, [fromIdea]);
 
   // Fetch brainstorm sessions for toolbar dropdown
   const { data: bsData } = useQuery({

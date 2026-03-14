@@ -187,9 +187,10 @@ export function IdeaCard({ idea, index, brainstormSessionId }: Props) {
 
   function handleGeneratePlan(e: React.MouseEvent) {
     e.stopPropagation();
-    const ideaParam = encodeURIComponent(JSON.stringify(idea));
+    // Store idea in sessionStorage to avoid URL length limits (431 error)
+    sessionStorage.setItem("prefill-idea", JSON.stringify(idea));
     const bsParam = brainstormSessionId ? `&bs_id=${brainstormSessionId}` : "";
-    router.push(`/topics/${topicId}/research-plan?idea=${ideaParam}${bsParam}`);
+    router.push(`/topics/${topicId}/research-plan?from_idea=1${bsParam}`);
   }
 
   function handleCheckPriorArt(e: React.MouseEvent) {
