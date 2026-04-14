@@ -236,6 +236,50 @@ export interface ChatSessionDetail extends ChatSession {
   messages: ChatMessage[];
 }
 
+// --- Deep Read ---
+
+export interface DeepReadSummaryCard {
+  key_innovations: string[];
+  strengths: string[];
+  weaknesses: string[];
+  field_comparison: string[];
+  inspiration_points: string[];
+}
+
+export interface DeepReadSession {
+  id: string;
+  topic_id: string;
+  paper_id: string;
+  paper_title: string;
+  status: "running" | "completed" | "failed";
+  started_at: string;
+  finished_at: string | null;
+  motivation_analysis: string;
+  method_analysis: string;
+  experiment_analysis: string;
+  contribution_analysis: string;
+  summary_card_json: DeepReadSummaryCard;
+  code_review: string;
+  repo_urls: string[];
+  repo_local_paths: string[];
+  user_notes: string;
+  language: string;
+}
+
+export interface DeepReadSessionDetail extends DeepReadSession {
+  messages: DeepReadMessage[];
+}
+
+export interface DeepReadMessage {
+  id: string;
+  session_id: string;
+  topic_id: string;
+  role: "user" | "assistant";
+  content: string;
+  status: "pending" | "generating" | "completed" | "failed";
+  created_at: string;
+}
+
 export interface TopicCreate {
   name: string;
   description?: string;
@@ -546,9 +590,116 @@ export const api = {
       `/api/topics/${topicId}/chat/${sessionId}/messages/${msgId}/progress`
     ),
 
+  // --- Deep Read ---
+  startDeepRead: (topicId: string, paperId: string, language: string = "en") =>
+    req<{ status: string; session_id: string }>(`/api/topics/${topicId}/deep-read`, {
+      method: "POST",
+      body: JSON.stringify({ paper_id: paperId, language }),
+    }),
+
+  listDeepReadSessions: (topicId: string, paperId?: string) => {
+    const qs = paperId ? `?paper_id=${encodeURIComponent(paperId)}` : "";
+    return req<{ sessions: DeepReadSession[] }>(`/api/topics/${topicId}/deep-read${qs}`);
+  },
+
+  getDeepReadSession: (topicId: string, sessionId: string) =>
+    req<DeepReadSessionDetail>(`/api/topics/${topicId}/deep-read/${sessionId}`),
+
+  getDeepReadProgress: (topicId: string, sessionId: string) =>
+    req<{
+      session_id: string;
+      status: string;
+      sections_done: string[];
+      current_section: string | null;
+    }>(`/api/topics/${topicId}/deep-read/${sessionId}/progress`),
+
+  deleteDeepReadSession: (topicId: string, sessionId: string) =>
+    req<void>(`/api/topics/${topicId}/deep-read/${sessionId}`, { method: "DELETE" }),
+
+  updateDeepReadNotes: (topicId: string, sessionId: string, notes: string) =>
+    req<{ status: string }>(`/api/topics/${topicId}/deep-read/${sessionId}/notes`, {
+      method: "PUT",
+      body: JSON.stringify({ notes }),
+    }),
+
+  sendDeepReadMessage: (topicId: string, sessionId: string, content: string) =>
+    req<{ user_msg_id: string; assistant_msg_id: string }>(
+      `/api/topics/${topicId}/deep-read/${sessionId}/messages`,
+      { method: "POST", body: JSON.stringify({ content }) },
+    ),
+
+  getDeepReadMessageProgress: (topicId: string, sessionId: string, msgId: string) =>
+    req<{ msg_id: string; status: string }>(
+      `/api/topics/${topicId}/deep-read/${sessionId}/messages/${msgId}/progress`,
+    ),
+
   // --- Usage ---
   getUsage: (service?: string) =>
     req<{ services: ServiceUsage[] }>(
       `/api/usage${service ? `?service=${service}` : ""}`
     ),
 };
+
+// --- Guided Create SSE ---
+
+export interface GuidedDelta {
+  text: string;
+}
+
+export interface GuidedDone {
+  message: string;
+  stage: "chatting" | "ready";
+  draft_config: TopicCreate | null;
+}
+
+export type GuidedEvent =
+  | { type: "delta"; data: GuidedDelta }
+  | { type: "done"; data: GuidedDone };
+
+export async function guidedCreateStream(
+  messages: { role: string; content: string }[],
+  onEvent: (event: GuidedEvent) => void,
+  signal?: AbortSignal,
+): Promise<void> {
+  const res = await fetch(`${BASE}/api/topics/guided`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ messages }),
+    signal,
+  });
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => res.statusText);
+    throw new Error(`${res.status} ${text}`);
+  }
+
+  const reader = res.body!.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+
+    const parts = buffer.split("\n\n");
+    buffer = parts.pop()!;
+
+    for (const part of parts) {
+      const lines = part.split("\n");
+      let eventType = "";
+      let dataStr = "";
+      for (const line of lines) {
+        if (line.startsWith("event: ")) eventType = line.slice(7);
+        else if (line.startsWith("data: ")) dataStr = line.slice(6);
+      }
+      if (!eventType || !dataStr) continue;
+      try {
+        const data = JSON.parse(dataStr);
+        onEvent({ type: eventType, data } as GuidedEvent);
+      } catch {
+        // skip malformed JSON
+      }
+    }
+  }
+}
