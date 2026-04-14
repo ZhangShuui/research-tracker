@@ -111,7 +111,6 @@ def stream_guided_response(messages: list[dict]) -> Generator[str, None, None]:
         "--include-partial-messages",
         "--model", "sonnet",
         "--system-prompt", SYSTEM_PROMPT,
-        "--bare",
     ]
 
     env = os.environ.copy()
