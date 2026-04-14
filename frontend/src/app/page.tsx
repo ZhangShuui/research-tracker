@@ -10,14 +10,20 @@ import {
   TrendingUp,
   Activity,
   Sigma,
+  ChevronDown,
+  MessageCircle,
+  Sparkles,
 } from "lucide-react";
 import Link from "next/link";
 import { api } from "@/lib/api";
 import { TopicCard } from "@/components/TopicCard";
 import { TopicForm } from "@/components/TopicForm";
+import { GuidedCreateModal } from "@/components/GuidedCreateModal";
 
 export default function DashboardPage() {
   const [showForm, setShowForm] = useState(false);
+  const [showGuided, setShowGuided] = useState(false);
+  const [showDropdown, setShowDropdown] = useState(false);
 
   const {
     data: topics,
@@ -69,13 +75,47 @@ export default function DashboardPage() {
                   className={isFetching ? "animate-spin" : ""}
                 />
               </button>
-              <button
-                onClick={() => setShowForm(true)}
-                className="flex items-center gap-2 px-4 py-2.5 bg-indigo-500 text-white rounded-lg hover:bg-indigo-400 transition-all text-sm font-medium shadow-lg shadow-indigo-500/25"
-              >
-                <Plus size={16} />
-                New Topic
-              </button>
+              <div className="relative">
+                <div className="flex">
+                  <button
+                    onClick={() => setShowForm(true)}
+                    className="flex items-center gap-2 px-4 py-2.5 bg-indigo-500 text-white rounded-l-lg hover:bg-indigo-400 transition-all text-sm font-medium shadow-lg shadow-indigo-500/25"
+                  >
+                    <Plus size={16} />
+                    New Topic
+                  </button>
+                  <button
+                    onClick={() => setShowDropdown(!showDropdown)}
+                    className="px-2 py-2.5 bg-indigo-500 text-white rounded-r-lg hover:bg-indigo-400 transition-all border-l border-indigo-400/50 shadow-lg shadow-indigo-500/25"
+                  >
+                    <ChevronDown size={14} />
+                  </button>
+                </div>
+                {showDropdown && (
+                  <div className="absolute right-0 mt-2 w-56 bg-white rounded-xl shadow-xl border border-slate-200 py-1 z-50">
+                    <button
+                      onClick={() => { setShowForm(true); setShowDropdown(false); }}
+                      className="w-full flex items-center gap-3 px-4 py-2.5 text-sm text-slate-700 hover:bg-slate-50 transition-colors"
+                    >
+                      <Sparkles size={16} className="text-indigo-500" />
+                      <div className="text-left">
+                        <div className="font-medium">Quick Create</div>
+                        <div className="text-xs text-slate-400">Name only, auto-generate config</div>
+                      </div>
+                    </button>
+                    <button
+                      onClick={() => { setShowGuided(true); setShowDropdown(false); }}
+                      className="w-full flex items-center gap-3 px-4 py-2.5 text-sm text-slate-700 hover:bg-slate-50 transition-colors"
+                    >
+                      <MessageCircle size={16} className="text-indigo-500" />
+                      <div className="text-left">
+                        <div className="font-medium">Guided Create</div>
+                        <div className="text-xs text-slate-400">Chat to refine your idea step by step</div>
+                      </div>
+                    </button>
+                  </div>
+                )}
+              </div>
             </div>
           </div>
 
@@ -161,13 +201,22 @@ export default function DashboardPage() {
               <p className="text-sm text-slate-400 mb-6">
                 Create your first research topic to start tracking papers.
               </p>
-              <button
-                onClick={() => setShowForm(true)}
-                className="inline-flex items-center gap-2 px-5 py-2.5 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 transition-colors text-sm font-medium shadow-md shadow-indigo-500/20"
-              >
-                <Plus size={16} />
-                Create your first topic
-              </button>
+              <div className="flex gap-3 justify-center">
+                <button
+                  onClick={() => setShowForm(true)}
+                  className="inline-flex items-center gap-2 px-5 py-2.5 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 transition-colors text-sm font-medium shadow-md shadow-indigo-500/20"
+                >
+                  <Sparkles size={16} />
+                  Quick Create
+                </button>
+                <button
+                  onClick={() => setShowGuided(true)}
+                  className="inline-flex items-center gap-2 px-5 py-2.5 bg-white text-indigo-600 border border-indigo-200 rounded-lg hover:bg-indigo-50 transition-colors text-sm font-medium"
+                >
+                  <MessageCircle size={16} />
+                  Guided Create
+                </button>
+              </div>
             </div>
           ) : (
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-5">
@@ -180,6 +229,7 @@ export default function DashboardPage() {
       </div>
 
       {showForm && <TopicForm onClose={() => setShowForm(false)} />}
+      {showGuided && <GuidedCreateModal onClose={() => setShowGuided(false)} />}
     </main>
   );
 }
