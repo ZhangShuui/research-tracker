@@ -41,8 +41,7 @@ When you are ready to propose a config, output it as:
   "description": "<one-sentence description>",
   "arxiv_keywords": ["<kw1>", "<kw2>", ...],
   "arxiv_categories": ["cs.LG", ...],
-  "github_keywords": ["<kw1>", ...],
-  "venues": ["<venue1>", ...]
+  "github_keywords": ["<kw1>", ...]
 }
 ```
 
@@ -237,19 +236,22 @@ def _fill_defaults(config: dict) -> dict:
     defaults = {
         "description": "",
         "arxiv_categories": [],
-        "github_keywords": [],
-        "venues": [],
-        "max_results": 0,
         "arxiv_lookback_days": 365,
+        "github_keywords": [],
         "github_lookback_days": 365,
         "search_date_from": one_year_ago.isoformat(),
         "search_date_to": today.isoformat(),
-        "openalex_enabled": True,
-        "openalex_keywords": first_four,
-        "openreview_enabled": True,
-        "openreview_keywords": first_four,
         "schedule_cron": "",
         "enabled": True,
+        "openalex_enabled": True,
+        "openalex_keywords": first_four,
+        "openalex_lookback_days": 365,
+        "openalex_venues": [],
+        "openalex_max_results": 200,
+        "openreview_enabled": True,
+        "openreview_venues": [],
+        "openreview_keywords": first_four,
+        "openreview_max_results": 100,
     }
 
     for key, value in defaults.items():
