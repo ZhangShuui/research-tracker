@@ -11,6 +11,7 @@ from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, field_validator
 
 from paper_tracker import config as cfg_module
@@ -224,7 +225,11 @@ def _generate_topic_config(name: str) -> dict:
 
 Generate a JSON object with:
 - "description": A concise 1-sentence description of this research area
-- "arxiv_keywords": A list of 3-6 search keyword phrases for finding relevant papers on arXiv (each 2-4 words, covering key aspects)
+- "arxiv_keywords": A list of 6-8 search keyword phrases for finding relevant papers on arXiv. IMPORTANT: these are used as exact phrase matches (all:"keyword") on arXiv API, so:
+  - At least 3 keywords MUST be short (1-2 words), e.g. "LLM agent", "diffusion"
+  - Remaining keywords can be 2-3 words max, e.g. "multi-step reasoning"
+  - NEVER use 4+ word phrases — they match almost nothing on arXiv
+  - Mix broad terms (high recall) with specific terms (high precision)
 - "arxiv_categories": A list of relevant arXiv categories (e.g. "cs.CV", "cs.AI", "cs.LG", "cs.CL", "cs.RO", "stat.ML")
 - "github_keywords": A list of 2-4 keyword phrases for finding related GitHub repos
 
@@ -239,10 +244,65 @@ Output ONLY the JSON object, no markdown fences, no explanation."""
             raw = re.sub(r"^```\w*\n?", "", raw)
             raw = re.sub(r"\n?```$", "", raw)
         try:
-            return _json.loads(raw)
+            result = _json.loads(raw)
+            # Post-process: split overly long keywords and ensure short ones exist
+            if "arxiv_keywords" in result:
+                result["arxiv_keywords"] = _fix_keywords(result["arxiv_keywords"])
+            return result
         except _json.JSONDecodeError:
             log.warning("Failed to parse LLM config output: %s", raw[:300])
     return {}
+
+
+def _fix_keywords(keywords: list[str]) -> list[str]:
+    """Ensure keywords are short enough for arXiv exact-phrase matching.
+
+    - Split any 4+ word phrase into shorter sub-phrases
+    - Ensure at least 3 keywords are 1-2 words
+    """
+    fixed: list[str] = []
+    for kw in keywords:
+        words = kw.strip().split()
+        if len(words) <= 2:
+            fixed.append(kw.strip())
+        elif len(words) == 3:
+            # Keep the 3-word phrase AND add a 2-word sub-phrase
+            fixed.append(kw.strip())
+            fixed.append(" ".join(words[:2]))
+        else:
+            # Split "agentic AI long-horizon tasks" → "agentic AI", "long-horizon tasks"
+            mid = len(words) // 2
+            fixed.append(" ".join(words[:mid]))
+            fixed.append(" ".join(words[mid:]))
+
+    # Deduplicate preserving order
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for kw in fixed:
+        low = kw.lower()
+        if low not in seen:
+            seen.add(low)
+            deduped.append(kw)
+
+    # Ensure at least 3 short (1-2 word) keywords
+    short_count = sum(1 for kw in deduped if len(kw.split()) <= 2)
+    if short_count < 3:
+        # Extract individual meaningful words from longer keywords as extra short keywords
+        all_words = set()
+        for kw in deduped:
+            for w in kw.split():
+                if len(w) >= 3 and w.lower() not in {"the", "and", "for", "with"}:
+                    all_words.add(w)
+        existing_lower = {kw.lower() for kw in deduped}
+        for w in sorted(all_words, key=len, reverse=True):
+            if w.lower() not in existing_lower:
+                deduped.append(w)
+                existing_lower.add(w.lower())
+                short_count += 1
+            if short_count >= 3:
+                break
+
+    return deduped
 
 
 @app.post("/api/topics/quick", status_code=201)
@@ -262,11 +322,13 @@ async def quick_create_topic(body: QuickTopicCreate) -> dict:
     date_from = (datetime.now(timezone.utc) - timedelta(days=365)).strftime("%Y-%m-%d")
     date_to = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
+    arxiv_kws = generated.get("arxiv_keywords", [body.name])
+
     topic = reg.create_topic({
         "id": topic_id,
         "name": body.name,
         "description": generated.get("description", ""),
-        "arxiv_keywords": generated.get("arxiv_keywords", [body.name]),
+        "arxiv_keywords": arxiv_kws,
         "arxiv_categories": generated.get("arxiv_categories", ["cs.CV", "cs.AI", "cs.LG"]),
         "arxiv_lookback_days": 365,
         "github_keywords": generated.get("github_keywords", [body.name]),
@@ -275,8 +337,43 @@ async def quick_create_topic(body: QuickTopicCreate) -> dict:
         "enabled": True,
         "search_date_from": date_from,
         "search_date_to": date_to,
+        # Enable OpenAlex & OpenReview by default, reuse arXiv keywords
+        "openalex_enabled": True,
+        "openalex_keywords": arxiv_kws[:4],
+        "openalex_lookback_days": 365,
+        "openreview_enabled": True,
+        "openreview_keywords": arxiv_kws[:4],
     })
     return topic
+
+
+# ---------------------------------------------------------------------------
+# Guided topic creation (streaming)
+# ---------------------------------------------------------------------------
+
+class GuidedMessage(BaseModel):
+    role: str
+    content: str
+
+class GuidedRequest(BaseModel):
+    messages: list[GuidedMessage]
+
+
+@app.post("/api/topics/guided")
+async def guided_create_topic(body: GuidedRequest):
+    """SSE streaming endpoint for guided topic creation conversation."""
+    from paper_tracker.guided import stream_guided_response
+
+    messages = [{"role": m.role, "content": m.content} for m in body.messages]
+    return StreamingResponse(
+        stream_guided_response(messages),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.post("/api/topics", status_code=201)
@@ -1279,6 +1376,285 @@ async def get_chat_message_progress(topic_id: str, session_id: str, msg_id: str)
     # Fallback to DB
     reg = _get_registry()
     msg = reg.get_chat_message(msg_id)
+    if not msg:
+        raise HTTPException(404, detail="Message not found")
+    return {"msg_id": msg_id, "status": msg["status"]}
+
+
+# ---------------------------------------------------------------------------
+# Deep Read endpoints
+# ---------------------------------------------------------------------------
+
+class DeepReadCreate(BaseModel):
+    paper_id: str
+    language: str = "en"
+
+class DeepReadMessageCreate(BaseModel):
+    content: str
+
+    @field_validator("content")
+    @classmethod
+    def content_not_empty(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("content must not be empty")
+        return v
+
+class DeepReadNotesUpdate(BaseModel):
+    notes: str
+
+# In-memory deep-read progress: session_id → {sections_done: [...], current_section, status}
+_deep_read_progress: dict[str, dict] = {}
+
+# In-memory deep-read QA progress: assistant_msg_id → {status}
+_deep_read_qa_progress: dict[str, dict] = {}
+
+
+@app.post("/api/topics/{topic_id}/deep-read", status_code=202)
+async def start_deep_read(topic_id: str, body: DeepReadCreate) -> dict:
+    """Start a deep reading analysis of a paper (5-stage background task)."""
+    reg = _get_registry()
+    topic = reg.get_topic(topic_id)
+    if not topic:
+        raise HTTPException(404, detail="Topic not found")
+
+    # Verify paper exists
+    store = Storage(_data_dir, topic_id)
+    try:
+        paper = store.get_arxiv(body.paper_id)
+    finally:
+        store.close()
+    if not paper:
+        raise HTTPException(404, detail=f"Paper not found: {body.paper_id}")
+
+    session = reg.create_deep_read_session(
+        topic_id, body.paper_id, paper_title=paper.get("title", ""), language=body.language,
+    )
+    session_id = session["id"]
+    topic_cfg = cfg_module.from_topic(topic, _base_cfg)
+
+    _deep_read_progress[session_id] = {
+        "status": "running",
+        "sections_done": [],
+        "current_section": "motivation_analysis",
+    }
+
+    def _run():
+        try:
+            from paper_tracker.deep_read import generate_deep_read
+
+            section_order = [
+                "motivation_analysis", "method_analysis",
+                "experiment_analysis", "contribution_analysis",
+                "summary_card_json", "code_review",
+            ]
+
+            def _on_section(section_name: str, content: str) -> None:
+                reg.update_deep_read_session(topic_id, session_id, {section_name: content})
+                done = _deep_read_progress.get(session_id, {}).get("sections_done", [])
+                done.append(section_name)
+                idx = section_order.index(section_name) if section_name in section_order else -1
+                next_section = section_order[idx + 1] if idx + 1 < len(section_order) else None
+                _deep_read_progress[session_id] = {
+                    "status": "running",
+                    "sections_done": done,
+                    "current_section": next_section,
+                }
+
+            result = generate_deep_read(
+                topic_id=topic_id,
+                topic_name=topic["name"],
+                data_dir=_data_dir,
+                cfg=topic_cfg,
+                paper_id=body.paper_id,
+                on_section_done=_on_section,
+                language=body.language,
+            )
+            from datetime import datetime, timezone
+            import json as _json
+            reg.update_deep_read_session(topic_id, session_id, {
+                "status": "completed",
+                "finished_at": datetime.now(timezone.utc).isoformat(),
+                "motivation_analysis": result.get("motivation_analysis", ""),
+                "method_analysis": result.get("method_analysis", ""),
+                "experiment_analysis": result.get("experiment_analysis", ""),
+                "contribution_analysis": result.get("contribution_analysis", ""),
+                "summary_card_json": _json.dumps(result.get("summary_card_json", {})),
+                "code_review": result.get("code_review", ""),
+                "repo_urls": _json.dumps(result.get("repo_urls", [])),
+                "repo_local_paths": _json.dumps(result.get("repo_local_paths", [])),
+            })
+            _deep_read_progress[session_id] = {
+                "status": "completed",
+                "sections_done": [
+                    "motivation_analysis", "method_analysis",
+                    "experiment_analysis", "contribution_analysis",
+                    "summary_card_json", "code_review",
+                ],
+                "current_section": None,
+            }
+        except Exception as e:
+            log.exception("Deep read generation failed: %s", e)
+            from datetime import datetime, timezone
+            reg.update_deep_read_session(topic_id, session_id, {
+                "status": "failed",
+                "finished_at": datetime.now(timezone.utc).isoformat(),
+            })
+            _deep_read_progress[session_id] = {"status": "failed", "sections_done": [], "current_section": None}
+
+    _brainstorm_executor.submit(_run)
+    return {"status": "started", "session_id": session_id}
+
+
+@app.get("/api/topics/{topic_id}/deep-read")
+async def list_deep_read_sessions(
+    topic_id: str,
+    paper_id: str = Query(default=""),
+) -> dict:
+    reg = _get_registry()
+    if not reg.get_topic(topic_id):
+        raise HTTPException(404, detail="Topic not found")
+    sessions = reg.list_deep_read_sessions(topic_id, paper_id=paper_id or None)
+    return {"sessions": sessions}
+
+
+@app.get("/api/topics/{topic_id}/deep-read/{session_id}")
+async def get_deep_read_session(topic_id: str, session_id: str) -> dict:
+    reg = _get_registry()
+    session = reg.get_deep_read_session(topic_id, session_id)
+    if not session:
+        raise HTTPException(404, detail="Deep read session not found")
+    messages = reg.list_deep_read_messages(topic_id, session_id)
+    return {**session, "messages": messages}
+
+
+@app.get("/api/topics/{topic_id}/deep-read/{session_id}/progress")
+async def get_deep_read_progress(topic_id: str, session_id: str) -> dict:
+    progress = _deep_read_progress.get(session_id)
+    if progress:
+        if progress["status"] in ("completed", "failed"):
+            _deep_read_progress.pop(session_id, None)
+        return {"session_id": session_id, **progress}
+    # Fallback to DB
+    reg = _get_registry()
+    session = reg.get_deep_read_session(topic_id, session_id)
+    if not session:
+        raise HTTPException(404, detail="Deep read session not found")
+    # Derive sections_done from non-empty fields
+    done = []
+    for s in ["motivation_analysis", "method_analysis", "experiment_analysis", "contribution_analysis", "code_review"]:
+        if session.get(s):
+            done.append(s)
+    card = session.get("summary_card_json")
+    if card and card != {} and card != "{}":
+        done.append("summary_card_json")
+    return {
+        "session_id": session_id,
+        "status": session["status"],
+        "sections_done": done,
+        "current_section": None,
+    }
+
+
+@app.delete("/api/topics/{topic_id}/deep-read/{session_id}", status_code=204)
+async def delete_deep_read_session(topic_id: str, session_id: str) -> None:
+    reg = _get_registry()
+    if not reg.delete_deep_read_session(topic_id, session_id):
+        raise HTTPException(404, detail="Deep read session not found")
+
+
+@app.put("/api/topics/{topic_id}/deep-read/{session_id}/notes")
+async def update_deep_read_notes(topic_id: str, session_id: str, body: DeepReadNotesUpdate) -> dict:
+    reg = _get_registry()
+    session = reg.get_deep_read_session(topic_id, session_id)
+    if not session:
+        raise HTTPException(404, detail="Deep read session not found")
+    reg.update_deep_read_session(topic_id, session_id, {"user_notes": body.notes})
+    return {"status": "saved"}
+
+
+@app.post("/api/topics/{topic_id}/deep-read/{session_id}/messages", status_code=202)
+async def send_deep_read_message(topic_id: str, session_id: str, body: DeepReadMessageCreate) -> dict:
+    reg = _get_registry()
+    topic = reg.get_topic(topic_id)
+    if not topic:
+        raise HTTPException(404, detail="Topic not found")
+    session = reg.get_deep_read_session(topic_id, session_id)
+    if not session:
+        raise HTTPException(404, detail="Deep read session not found")
+    if session["status"] != "completed":
+        raise HTTPException(409, detail="Can only ask questions on completed deep reads")
+
+    # Save user message
+    user_msg = reg.add_deep_read_message(topic_id, session_id, "user", body.content)
+
+    # Create assistant placeholder
+    assistant_msg = reg.add_deep_read_message(
+        topic_id, session_id, "assistant", "", status="pending",
+    )
+    assistant_msg_id = assistant_msg["id"]
+    _deep_read_qa_progress[assistant_msg_id] = {"status": "pending"}
+
+    topic_cfg = cfg_module.from_topic(topic, _base_cfg)
+
+    def _run():
+        try:
+            from paper_tracker.deep_read import generate_deep_read_qa
+
+            reg.update_deep_read_message(assistant_msg_id, {"status": "generating"})
+            _deep_read_qa_progress[assistant_msg_id] = {"status": "generating"}
+
+            # Load paper
+            store = Storage(_data_dir, topic_id)
+            try:
+                paper = store.get_arxiv(session["paper_id"])
+            finally:
+                store.close()
+
+            prior = reg.list_deep_read_messages(topic_id, session_id)
+            prior = [m for m in prior if m["id"] != assistant_msg_id]
+
+            existing_analysis = {
+                "motivation_analysis": session.get("motivation_analysis", ""),
+                "method_analysis": session.get("method_analysis", ""),
+                "experiment_analysis": session.get("experiment_analysis", ""),
+                "contribution_analysis": session.get("contribution_analysis", ""),
+                "code_review": session.get("code_review", ""),
+            }
+
+            result = generate_deep_read_qa(
+                paper=paper or {},
+                existing_analysis=existing_analysis,
+                prior_messages=prior,
+                user_question=body.content,
+                cfg=topic_cfg,
+                language=session.get("language", "en"),
+            )
+            reg.update_deep_read_message(assistant_msg_id, {
+                "content": result["content"],
+                "status": "completed",
+            })
+            _deep_read_qa_progress[assistant_msg_id] = {"status": "completed"}
+        except Exception as e:
+            log.exception("Deep read QA failed: %s", e)
+            reg.update_deep_read_message(assistant_msg_id, {
+                "content": "An error occurred while generating the response.",
+                "status": "failed",
+            })
+            _deep_read_qa_progress[assistant_msg_id] = {"status": "failed"}
+
+    _brainstorm_executor.submit(_run)
+    return {"user_msg_id": user_msg["id"], "assistant_msg_id": assistant_msg_id}
+
+
+@app.get("/api/topics/{topic_id}/deep-read/{session_id}/messages/{msg_id}/progress")
+async def get_deep_read_message_progress(topic_id: str, session_id: str, msg_id: str) -> dict:
+    progress = _deep_read_qa_progress.get(msg_id)
+    if progress:
+        if progress["status"] in ("completed", "failed"):
+            _deep_read_qa_progress.pop(msg_id, None)
+        return {"msg_id": msg_id, **progress}
+    reg = _get_registry()
+    msg = reg.get_deep_read_message(msg_id)
     if not msg:
         raise HTTPException(404, detail="Message not found")
     return {"msg_id": msg_id, "status": msg["status"]}
