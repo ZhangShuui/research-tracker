@@ -18,6 +18,7 @@ import { TopicForm } from "@/components/TopicForm";
 const TABS = [
   { label: "Overview", href: "" },
   { label: "Papers", href: "/papers" },
+  { label: "Deep Read", href: "/deep-read" },
   { label: "Insights", href: "/insights" },
   { label: "Brainstorm", href: "/brainstorm" },
   { label: "Research Plan", href: "/research-plan" },

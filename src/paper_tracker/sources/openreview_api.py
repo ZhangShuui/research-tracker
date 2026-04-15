@@ -7,6 +7,8 @@ import time
 
 import httpx
 
+from paper_tracker.sources import httpx_get_with_retry
+
 log = logging.getLogger(__name__)
 
 _OR_API = "https://api2.openreview.net/notes/search"
@@ -125,12 +127,7 @@ def _search_venue(
         params["offset"] = offset
 
         try:
-            resp = httpx.get(search_url, params=params, timeout=30, follow_redirects=True)
-            if resp.status_code == 429:
-                log.warning("OpenReview rate limited, waiting 5s")
-                time.sleep(5)
-                continue
-            resp.raise_for_status()
+            resp = httpx_get_with_retry(search_url, params=params, timeout=30)
         except httpx.HTTPError as e:
             log.error("OpenReview API failed (offset=%d): %s", offset, e)
             break

@@ -6,6 +6,8 @@ import logging
 
 import httpx
 
+from paper_tracker.sources import httpx_get_with_retry
+
 log = logging.getLogger(__name__)
 
 _HF_API = "https://huggingface.co/api/daily_papers"
@@ -19,8 +21,7 @@ def fetch_daily_papers() -> list[dict]:
     log.info("Fetching HuggingFace daily papers")
 
     try:
-        resp = httpx.get(_HF_API, timeout=30, follow_redirects=True)
-        resp.raise_for_status()
+        resp = httpx_get_with_retry(_HF_API, timeout=30)
         data = resp.json()
     except httpx.HTTPError as e:
         log.error("HuggingFace API request failed: %s", e)

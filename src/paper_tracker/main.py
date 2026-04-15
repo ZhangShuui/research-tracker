@@ -11,7 +11,7 @@ from pathlib import Path
 from paper_tracker import config
 from paper_tracker.sources import arxiv, github
 from paper_tracker.sources import openalex, openreview_api
-from paper_tracker.storage import Storage
+from paper_tracker.storage import Storage, normalize_doi
 from paper_tracker import summarizer, report, insights
 
 
@@ -31,6 +31,10 @@ def _setup_logging(logs_dir: str) -> None:
     )
 
 
+class _Cancelled(Exception):
+    """Raised when the pipeline is cancelled via cancel_event."""
+
+
 def run_pipeline(
     topic_cfg: dict,
     session_id: str,
@@ -39,21 +43,32 @@ def run_pipeline(
     data_dir: str,
     session_dir: str | Path,
     on_progress: "callable | None" = None,
+    cancel_event: "threading.Event | None" = None,
 ) -> dict:
     """Run the full pipeline for a single topic/session.
 
     Returns a dict with keys: paper_count, repo_count, report_path, insights_path, status.
 
     on_progress(stage, detail_dict) is called at each stage transition.
+    cancel_event: if set(), the pipeline will abort at the next stage boundary.
     """
     log = logging.getLogger("paper_tracker")
     log.info("=== Pipeline started: topic=%s session=%s ===", topic_id, session_id)
 
+    def _check_cancelled() -> None:
+        if cancel_event and cancel_event.is_set():
+            log.info("Pipeline cancelled: topic=%s session=%s", topic_id, session_id)
+            raise _Cancelled()
+
     def _progress(stage: str, **detail: object) -> None:
+        _check_cancelled()
         if on_progress:
             on_progress(stage, detail)
 
-    _progress("fetching", message="Searching sources...")
+    try:
+        _progress("fetching", message="Searching sources...")
+    except _Cancelled:
+        return {"paper_count": 0, "repo_count": 0, "report_path": "", "insights_path": "", "status": "cancelled"}
 
     store = Storage(data_dir, topic_id)
     search_cfg = topic_cfg.get("search", {})
@@ -88,6 +103,8 @@ def run_pipeline(
                 _progress("fetching", message=f"arXiv: {len(raw_papers)} papers",
                           sources_total=len(source_names), sources_done=sources_done,
                           papers_fetched=len(raw_papers))
+            except _Cancelled:
+                raise
             except Exception as e:
                 log.error("arXiv source failed: %s", e)
                 sources_done += 1
@@ -99,6 +116,8 @@ def run_pipeline(
                 _progress("fetching", message=f"GitHub: {len(raw_repos)} repos",
                           sources_total=len(source_names), sources_done=sources_done,
                           papers_fetched=len(raw_papers), repos_fetched=len(raw_repos))
+            except _Cancelled:
+                raise
             except Exception as e:
                 log.error("GitHub source failed: %s", e)
                 sources_done += 1
@@ -112,6 +131,8 @@ def run_pipeline(
                     _progress("fetching", message=f"OpenAlex: +{len(oa_papers)} papers",
                               sources_total=len(source_names), sources_done=sources_done,
                               papers_fetched=len(raw_papers))
+                except _Cancelled:
+                    raise
                 except Exception as e:
                     log.error("OpenAlex source failed: %s", e)
                     sources_done += 1
@@ -125,6 +146,8 @@ def run_pipeline(
                     _progress("fetching", message=f"OpenReview: +{len(or_papers)} papers",
                               sources_total=len(source_names), sources_done=sources_done,
                               papers_fetched=len(raw_papers))
+                except _Cancelled:
+                    raise
                 except Exception as e:
                     log.error("OpenReview source failed: %s", e)
                     sources_done += 1
@@ -135,14 +158,23 @@ def run_pipeline(
         _progress("deduplicating", message=f"Deduplicating {len(raw_papers)} papers...",
                   papers_fetched=len(raw_papers))
 
-        seen_in_batch: set[str] = set()
+        seen_ids_in_batch: set[str] = set()
+        seen_dois_in_batch: set[str] = set()
         new_papers: list[dict] = []
         for p in raw_papers:
             pid = p.get("paper_id", p["arxiv_id"])
-            if pid in seen_in_batch:
+            doi = normalize_doi(p.get("doi", ""))
+            # In-batch dedup by paper_id
+            if pid in seen_ids_in_batch:
                 continue
-            seen_in_batch.add(pid)
-            if store.is_paper_seen(pid):
+            # In-batch dedup by DOI (catches same paper from different sources)
+            if doi and doi in seen_dois_in_batch:
+                continue
+            seen_ids_in_batch.add(pid)
+            if doi:
+                seen_dois_in_batch.add(doi)
+            # DB dedup: paper_id / arxiv_id / doi
+            if store.is_paper_seen(pid, doi=doi):
                 continue
             # Also check raw arxiv_id for arXiv-origin papers
             if p.get("arxiv_id") != pid and store.is_arxiv_seen(p["arxiv_id"]):
@@ -212,6 +244,13 @@ def run_pipeline(
         if insights_path:
             result["insights_path"] = str(insights_path)
 
+    except _Cancelled:
+        log.info("Pipeline cancelled: topic=%s session=%s", topic_id, session_id)
+        return {
+            "paper_count": 0, "repo_count": 0,
+            "report_path": "", "insights_path": "",
+            "status": "cancelled",
+        }
     finally:
         store.close()
 

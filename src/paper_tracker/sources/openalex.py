@@ -14,6 +14,8 @@ from datetime import datetime, timedelta, timezone
 
 import httpx
 
+from paper_tracker.sources import httpx_get_with_retry
+
 log = logging.getLogger(__name__)
 
 _OA_API = "https://api.openalex.org/works"
@@ -78,9 +80,7 @@ def search(cfg: dict) -> list[dict]:
             params["filter"] = ",".join(filters)
 
         try:
-            resp = httpx.get(_OA_API, params=params, headers=headers,
-                             timeout=30, follow_redirects=True)
-            resp.raise_for_status()
+            resp = httpx_get_with_retry(_OA_API, params=params, headers=headers, timeout=30)
         except httpx.HTTPError as e:
             log.error("OpenAlex API request failed (page=%d): %s", page, e)
             break
@@ -204,6 +204,7 @@ def _parse_item(item: dict) -> dict | None:
         "venue": venue_display,
         "cited_works": [],
         "citation_count": citation_count,
+        "doi": doi,  # raw DOI (normalized by storage on insert)
     }
 
 

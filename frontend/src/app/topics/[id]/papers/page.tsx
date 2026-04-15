@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect, useCallback, useRef } from "react";
-import { useParams } from "next/navigation";
+import { useParams, useRouter } from "next/navigation";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, Paper } from "@/lib/api";
 import { useDebounce } from "@/lib/hooks";
@@ -15,6 +15,7 @@ const PAGE_SIZE = 24;
 
 export default function PapersPage() {
   const { id } = useParams<{ id: string }>();
+  const router = useRouter();
   const queryClient = useQueryClient();
 
   const [search, setSearch] = useState("");
@@ -120,6 +121,10 @@ export default function PapersPage() {
     }
   }, [id, invalidatePapers]);
 
+  const handleDeepRead = useCallback((arxivId: string) => {
+    router.push(`/topics/${id}/deep-read?paper=${encodeURIComponent(arxivId)}`);
+  }, [id, router]);
+
   return (
     <div className="space-y-4">
       <PaperToolbar
@@ -162,6 +167,7 @@ export default function PapersPage() {
               paper={p}
               onClick={() => setSelected(p)}
               onDelete={handleDelete}
+              onDeepRead={handleDeepRead}
             />
           ))}
         </div>
@@ -171,6 +177,7 @@ export default function PapersPage() {
             papers={data.papers}
             onSelect={setSelected}
             onDelete={handleDelete}
+            onDeepRead={handleDeepRead}
           />
         </div>
       )}
@@ -189,6 +196,7 @@ export default function PapersPage() {
           paper={selected}
           onClose={() => setSelected(null)}
           onDelete={handleDelete}
+          onDeepRead={handleDeepRead}
         />
       )}
     </div>

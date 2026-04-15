@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { X, ExternalLink, Trash2 } from "lucide-react";
+import { X, ExternalLink, Trash2, BookOpen } from "lucide-react";
 import { Paper } from "@/lib/api";
 import { TranslateButton, TranslatedBlock } from "./TranslateButton";
 
@@ -9,9 +9,10 @@ interface Props {
   paper: Paper;
   onClose: () => void;
   onDelete?: (arxivId: string) => void;
+  onDeepRead?: (arxivId: string) => void;
 }
 
-export function PaperDetailModal({ paper, onClose, onDelete }: Props) {
+export function PaperDetailModal({ paper, onClose, onDelete, onDeepRead }: Props) {
   const [translatedText, setTranslatedText] = useState<string | null>(null);
 
   const fullContent = [
@@ -45,6 +46,15 @@ export function PaperDetailModal({ paper, onClose, onDelete }: Props) {
             >
               <ExternalLink size={16} />
             </a>
+            {onDeepRead && (
+              <button
+                onClick={() => onDeepRead(paper.arxiv_id)}
+                className="p-1.5 rounded-lg hover:bg-indigo-50 hover:text-indigo-600 transition-colors text-gray-500"
+                title="Deep Read"
+              >
+                <BookOpen size={16} />
+              </button>
+            )}
             <TranslateButton
               sourceType="paper"
               sourceId={paper.arxiv_id}

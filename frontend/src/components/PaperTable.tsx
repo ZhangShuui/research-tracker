@@ -1,15 +1,16 @@
 "use client";
 
-import { ExternalLink, Trash2 } from "lucide-react";
+import { ExternalLink, Trash2, BookOpen } from "lucide-react";
 import { Paper } from "@/lib/api";
 
 interface Props {
   papers: Paper[];
   onSelect: (paper: Paper) => void;
   onDelete?: (arxivId: string) => void;
+  onDeepRead?: (arxivId: string) => void;
 }
 
-export function PaperTable({ papers, onSelect, onDelete }: Props) {
+export function PaperTable({ papers, onSelect, onDelete, onDeepRead }: Props) {
   return (
     <div className="overflow-x-auto">
       <table className="w-full text-sm">
@@ -69,6 +70,18 @@ export function PaperTable({ papers, onSelect, onDelete }: Props) {
               </td>
               <td className="py-2.5">
                 <div className="flex items-center gap-1">
+                  {onDeepRead && (
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onDeepRead(p.arxiv_id);
+                      }}
+                      className="text-gray-400 hover:text-indigo-600 transition-colors"
+                      title="Deep Read"
+                    >
+                      <BookOpen size={14} />
+                    </button>
+                  )}
                   <a
                     href={p.url}
                     target="_blank"

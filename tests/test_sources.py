@@ -10,6 +10,7 @@ import pytest
 
 from paper_tracker.sources.arxiv import search_broad, _parse_entries
 from paper_tracker.sources.huggingface import fetch_daily_papers
+from paper_tracker.sources.openalex import _parse_item as oa_parse_item
 from paper_tracker.sources.paperswithcode import fetch_trending
 
 
@@ -48,6 +49,8 @@ class TestParseEntries:
         assert papers[0]["arxiv_id"] == "2603.01234"
         assert papers[0]["title"] == "Good Paper"
         assert papers[0]["url"] == "https://arxiv.org/abs/2603.01234"
+        # arxiv source should synthesize an arxiv DOI for cross-source dedup
+        assert papers[0]["doi"] == "10.48550/arxiv.2603.01234"
 
     def test_filters_old_papers(self):
         xml = _make_arxiv_xml([
@@ -90,6 +93,51 @@ class TestParseEntries:
         assert p["summary"] == ""
         assert p["key_insight"] == ""
         assert p["math_concepts"] == []
+
+
+# ---------------------------------------------------------------
+# OpenAlex _parse_item — DOI emission for cross-source dedup
+# ---------------------------------------------------------------
+
+class TestOpenAlexDoiEmission:
+    def _base_item(self, **overrides) -> dict:
+        item = {
+            "title": "Test Paper",
+            "ids": {"doi": "https://doi.org/10.1109/CVPR.2024.123",
+                    "openalex": "https://openalex.org/W12345"},
+            "authorships": [],
+            "abstract": "",
+            "publication_date": "2024-05-01",
+            "publication_year": 2024,
+            "primary_location": {"source": {"display_name": "CVPR"}},
+            "locations": [],
+            "cited_by_count": 0,
+        }
+        item.update(overrides)
+        return item
+
+    def test_emits_doi_field(self):
+        p = oa_parse_item(self._base_item())
+        assert p is not None
+        assert "doi" in p
+        # Raw DOI preserved — storage normalizes on insert
+        assert "cvpr" in p["doi"].lower()
+
+    def test_doi_field_empty_when_missing(self):
+        item = self._base_item(ids={"openalex": "https://openalex.org/W1"})
+        item.pop("doi", None)
+        p = oa_parse_item(item)
+        assert p is not None
+        assert p["doi"] == ""
+
+    def test_arxiv_doi_extraction(self):
+        """Arxiv-style DOI → arxiv_id extracted AND doi preserved for dedup."""
+        item = self._base_item(
+            ids={"doi": "https://doi.org/10.48550/arxiv.2401.12345"},
+        )
+        p = oa_parse_item(item)
+        assert p["paper_id"] == "2401.12345"
+        assert "arxiv.2401.12345" in p["doi"]
 
 
 # ---------------------------------------------------------------

@@ -49,7 +49,27 @@ _NEW_ARXIV_COLUMNS = [
     ("paper_id", "TEXT DEFAULT ''"),
     ("source", "TEXT DEFAULT 'arxiv'"),
     ("citation_count", "INTEGER DEFAULT 0"),
+    ("doi", "TEXT DEFAULT ''"),
 ]
+
+
+def normalize_doi(doi: str) -> str:
+    """Normalize a DOI to a canonical form for cross-source matching.
+
+    Lowercases, strips http(s)://doi.org/ prefix and whitespace.
+    Returns empty string if the input doesn't look like a DOI.
+    """
+    if not doi:
+        return ""
+    d = doi.strip().lower()
+    for prefix in ("https://doi.org/", "http://doi.org/", "doi:"):
+        if d.startswith(prefix):
+            d = d[len(prefix):]
+            break
+    # Minimal sanity check: DOIs start with "10."
+    if not d.startswith("10."):
+        return ""
+    return d
 
 
 class Storage:
@@ -174,11 +194,28 @@ class Storage:
         ).fetchone()
         return row is not None
 
-    def is_paper_seen(self, paper_id: str) -> bool:
-        """Check both paper_id and arxiv_id columns for dedup across sources."""
+    def is_paper_seen(self, paper_id: str, doi: str = "") -> bool:
+        """Check paper_id, arxiv_id, and (optionally) doi columns for cross-source dedup."""
+        normalized_doi = normalize_doi(doi) if doi else ""
+        if normalized_doi:
+            row = self._conn.execute(
+                "SELECT 1 FROM seen_arxiv WHERE paper_id = ? OR arxiv_id = ? OR doi = ?",
+                (paper_id, paper_id, normalized_doi),
+            ).fetchone()
+        else:
+            row = self._conn.execute(
+                "SELECT 1 FROM seen_arxiv WHERE paper_id = ? OR arxiv_id = ?",
+                (paper_id, paper_id),
+            ).fetchone()
+        return row is not None
+
+    def is_doi_seen(self, doi: str) -> bool:
+        """Check if a paper with this DOI has already been stored."""
+        normalized = normalize_doi(doi)
+        if not normalized:
+            return False
         row = self._conn.execute(
-            "SELECT 1 FROM seen_arxiv WHERE paper_id = ? OR arxiv_id = ?",
-            (paper_id, paper_id),
+            "SELECT 1 FROM seen_arxiv WHERE doi = ?", (normalized,),
         ).fetchone()
         return row is not None
 
@@ -187,10 +224,10 @@ class Storage:
             """INSERT OR IGNORE INTO seen_arxiv
                (arxiv_id, title, authors, abstract, url, published, summary,
                 key_insight, method, contribution, math_concepts, venue, cited_works,
-                quality_score, paper_id, source, citation_count)
+                quality_score, paper_id, source, citation_count, doi)
                VALUES (:arxiv_id, :title, :authors, :abstract, :url, :published, :summary,
                        :key_insight, :method, :contribution, :math_concepts, :venue, :cited_works,
-                       :quality_score, :paper_id, :source, :citation_count)""",
+                       :quality_score, :paper_id, :source, :citation_count, :doi)""",
             {
                 **paper,
                 "key_insight": paper.get("key_insight", ""),
@@ -203,6 +240,7 @@ class Storage:
                 "paper_id": paper.get("paper_id", paper.get("arxiv_id", "")),
                 "source": paper.get("source", "arxiv"),
                 "citation_count": paper.get("citation_count", 0),
+                "doi": normalize_doi(paper.get("doi", "")),
             },
         )
         self._conn.commit()

@@ -7,6 +7,8 @@ from datetime import datetime, timedelta, timezone
 
 import httpx
 
+from paper_tracker.sources import httpx_get_with_retry
+
 log = logging.getLogger(__name__)
 
 _GITHUB_SEARCH_API = "https://api.github.com/search/repositories"
@@ -33,13 +35,12 @@ def search(cfg: dict) -> list[dict]:
         log.info("GitHub query: %s", query)
 
         try:
-            resp = httpx.get(
+            resp = httpx_get_with_retry(
                 _GITHUB_SEARCH_API,
                 params=params,
                 headers={"Accept": "application/vnd.github.v3+json"},
                 timeout=30,
             )
-            resp.raise_for_status()
         except httpx.HTTPError as e:
             log.error("GitHub API request failed for '%s': %s", kw, e)
             continue

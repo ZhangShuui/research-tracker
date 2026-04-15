@@ -41,6 +41,7 @@ export interface Session {
   status: "running" | "completed" | "failed";
   report_path: string;
   insights_path: string;
+  error_message?: string;
   report_content?: string;
   insights_content?: string;
 }

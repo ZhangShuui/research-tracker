@@ -1,7 +1,8 @@
 "use client";
 
+import { Fragment } from "react";
 import { Session } from "@/lib/api";
-import { FileText, GitFork } from "lucide-react";
+import { FileText, GitFork, AlertCircle } from "lucide-react";
 
 interface Props {
   sessions: Session[];
@@ -48,51 +49,64 @@ export function SessionList({ sessions, onSelect, selectedId }: Props) {
         </thead>
         <tbody className="divide-y divide-slate-100">
           {sessions.map((s, idx) => (
-            <tr
-              key={s.id}
-              onClick={() => onSelect(s)}
-              className={`cursor-pointer transition-colors duration-150 ${
-                selectedId === s.id
-                  ? "bg-indigo-50/70 hover:bg-indigo-50"
-                  : idx % 2 === 0
-                  ? "bg-white hover:bg-slate-50"
-                  : "bg-slate-50/30 hover:bg-slate-50"
-              }`}
-            >
-              <td className="px-4 py-3 font-mono text-xs text-indigo-600 font-medium">
-                {s.id}
-              </td>
-              <td className="px-4 py-3 text-slate-600 text-xs">
-                {s.started_at
-                  ? new Date(s.started_at).toLocaleDateString(undefined, {
-                      month: "short",
-                      day: "numeric",
-                      year: "numeric",
-                      hour: "2-digit",
-                      minute: "2-digit",
-                    })
-                  : "\u2014"}
-              </td>
-              <td className="px-4 py-3 text-center">
-                <span className="inline-flex items-center gap-1 text-xs text-slate-600">
-                  <FileText size={11} className="text-indigo-300" />
-                  <span className="font-medium tabular-nums">
-                    {s.paper_count}
+            <Fragment key={s.id}>
+              <tr
+                onClick={() => onSelect(s)}
+                className={`cursor-pointer transition-colors duration-150 ${
+                  selectedId === s.id
+                    ? "bg-indigo-50/70 hover:bg-indigo-50"
+                    : idx % 2 === 0
+                    ? "bg-white hover:bg-slate-50"
+                    : "bg-slate-50/30 hover:bg-slate-50"
+                }`}
+              >
+                <td className="px-4 py-3 font-mono text-xs text-indigo-600 font-medium">
+                  {s.id}
+                </td>
+                <td className="px-4 py-3 text-slate-600 text-xs">
+                  {s.started_at
+                    ? new Date(s.started_at).toLocaleDateString(undefined, {
+                        month: "short",
+                        day: "numeric",
+                        year: "numeric",
+                        hour: "2-digit",
+                        minute: "2-digit",
+                      })
+                    : "\u2014"}
+                </td>
+                <td className="px-4 py-3 text-center">
+                  <span className="inline-flex items-center gap-1 text-xs text-slate-600">
+                    <FileText size={11} className="text-indigo-300" />
+                    <span className="font-medium tabular-nums">
+                      {s.paper_count}
+                    </span>
                   </span>
-                </span>
-              </td>
-              <td className="px-4 py-3 text-center">
-                <span className="inline-flex items-center gap-1 text-xs text-slate-600">
-                  <GitFork size={11} className="text-emerald-300" />
-                  <span className="font-medium tabular-nums">
-                    {s.repo_count}
+                </td>
+                <td className="px-4 py-3 text-center">
+                  <span className="inline-flex items-center gap-1 text-xs text-slate-600">
+                    <GitFork size={11} className="text-emerald-300" />
+                    <span className="font-medium tabular-nums">
+                      {s.repo_count}
+                    </span>
                   </span>
-                </span>
-              </td>
-              <td className="px-4 py-3">
-                <StatusBadge status={s.status} />
-              </td>
-            </tr>
+                </td>
+                <td className="px-4 py-3">
+                  <StatusBadge status={s.status} />
+                </td>
+              </tr>
+              {s.status === "failed" && s.error_message && (
+                <tr className="bg-red-50/40">
+                  <td colSpan={5} className="px-4 py-2.5">
+                    <div className="flex gap-2 items-start text-xs text-red-700">
+                      <AlertCircle size={13} className="mt-0.5 text-red-500 shrink-0" />
+                      <pre className="whitespace-pre-wrap font-mono text-[11px] leading-relaxed break-all flex-1">
+                        {s.error_message}
+                      </pre>
+                    </div>
+                  </td>
+                </tr>
+              )}
+            </Fragment>
           ))}
         </tbody>
       </table>

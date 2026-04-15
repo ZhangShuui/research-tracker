@@ -7,6 +7,8 @@ import re
 
 import httpx
 
+from paper_tracker.sources import httpx_get_with_retry
+
 log = logging.getLogger(__name__)
 
 _PWC_API = "https://paperswithcode.com/api/v1/papers/"
@@ -20,13 +22,11 @@ def fetch_trending(max_papers: int = 50) -> list[dict]:
     log.info("Fetching Papers With Code trending (max=%d)", max_papers)
 
     try:
-        resp = httpx.get(
+        resp = httpx_get_with_retry(
             _PWC_API,
             params={"ordering": "-trending", "items_per_page": min(max_papers, 50)},
             timeout=30,
-            follow_redirects=True,
         )
-        resp.raise_for_status()
         data = resp.json()
     except httpx.HTTPError as e:
         log.error("Papers With Code API request failed: %s", e)

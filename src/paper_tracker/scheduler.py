@@ -27,6 +27,7 @@ class Scheduler:
         self._base_cfg = base_cfg
         self._scheduler = BackgroundScheduler()
         self._running: dict[str, Future] = {}
+        self._cancel_flags: dict[str, threading.Event] = {}
         self._lock = threading.Lock()
         # Pipeline progress: topic_id → {stage, message, ...}
         self.progress: dict[str, dict] = {}
@@ -65,7 +66,9 @@ class Scheduler:
         with self._lock:
             if topic_id in self._running and not self._running[topic_id].done():
                 return False
-            future = _executor.submit(self._run_topic, topic_id)
+            cancel_event = threading.Event()
+            self._cancel_flags[topic_id] = cancel_event
+            future = _executor.submit(self._run_topic, topic_id, cancel_event)
             self._running[topic_id] = future
             return True
 
@@ -75,12 +78,14 @@ class Scheduler:
             return f is not None and not f.done()
 
     def cancel(self, topic_id: str) -> bool:
-        """Attempt to cancel a running job. Returns True if cancelled."""
+        """Signal a running job to stop. Returns True if a running job was found."""
         with self._lock:
             f = self._running.get(topic_id)
             if f and not f.done():
-                cancelled = f.cancel()
-                return cancelled
+                ev = self._cancel_flags.get(topic_id)
+                if ev:
+                    ev.set()
+                return True
         return False
 
     def update_schedule(self, topic_id: str, cron: str) -> None:
@@ -107,7 +112,7 @@ class Scheduler:
             self._scheduler.remove_job(job_id)
             log.info("Removed cron job for topic %s", topic_id)
 
-    def _run_topic(self, topic_id: str) -> None:
+    def _run_topic(self, topic_id: str, cancel_event: threading.Event | None = None) -> None:
         from paper_tracker import config as cfg_module
         from paper_tracker.main import run_pipeline
 
@@ -141,9 +146,11 @@ class Scheduler:
                 data_dir=self._data_dir,
                 session_dir=session_dir,
                 on_progress=_on_progress,
+                cancel_event=cancel_event,
             )
+            status = result.get("status", "completed")
             self._registry.update_session(topic_id, session_id, {
-                "status": "completed",
+                "status": status,
                 "finished_at": datetime.now(timezone.utc).isoformat(),
                 "paper_count": result["paper_count"],
                 "repo_count": result["repo_count"],
@@ -153,8 +160,19 @@ class Scheduler:
             self.progress.pop(topic_id, None)
         except Exception as e:
             log.exception("Pipeline failed for topic %s session %s: %s", topic_id, session_id, e)
+            import traceback
+            tb = traceback.format_exc()
+            # Keep a compact message for UI: exception class + message + last frame
+            err_msg = f"{type(e).__name__}: {e}"
+            # Append last 2 traceback lines (most useful for debugging)
+            tb_lines = [line for line in tb.strip().splitlines() if line.strip()]
+            if len(tb_lines) >= 2:
+                err_msg += "\n\n" + "\n".join(tb_lines[-3:])
             self._registry.update_session(topic_id, session_id, {
                 "status": "failed",
                 "finished_at": datetime.now(timezone.utc).isoformat(),
+                "error_message": err_msg[:2000],  # cap length
             })
             self.progress.pop(topic_id, None)
+        finally:
+            self._cancel_flags.pop(topic_id, None)

@@ -115,7 +115,16 @@ class Registry:
         self._migrate_topic_sources()
         self._migrate_research_plan_history()
         self._migrate_chat_tables()
+        self._migrate_deep_read_tables()
+        self._migrate_session_error()
         self._lock = threading.Lock()
+
+    def _migrate_session_error(self) -> None:
+        """Add error_message column to sessions if missing."""
+        cols = {r[1] for r in self._conn.execute("PRAGMA table_info(sessions)").fetchall()}
+        if "error_message" not in cols:
+            self._conn.execute("ALTER TABLE sessions ADD COLUMN error_message TEXT DEFAULT ''")
+            self._conn.commit()
 
     def _migrate_discovery_quality(self) -> None:
         """Add quality_score/quality_flags columns if missing (migration)."""
@@ -166,6 +175,53 @@ class Registry:
             );
         """)
         self._conn.commit()
+
+    def _migrate_deep_read_tables(self) -> None:
+        """Create deep_read_sessions and deep_read_messages tables if missing."""
+        self._conn.executescript("""
+            CREATE TABLE IF NOT EXISTS deep_read_sessions (
+                id TEXT PRIMARY KEY,
+                topic_id TEXT NOT NULL,
+                paper_id TEXT NOT NULL,
+                paper_title TEXT DEFAULT '',
+                status TEXT DEFAULT 'running',
+                started_at TEXT,
+                finished_at TEXT,
+                motivation_analysis TEXT DEFAULT '',
+                method_analysis TEXT DEFAULT '',
+                experiment_analysis TEXT DEFAULT '',
+                contribution_analysis TEXT DEFAULT '',
+                summary_card_json TEXT DEFAULT '{}',
+                user_notes TEXT DEFAULT '',
+                FOREIGN KEY (topic_id) REFERENCES topics(id)
+            );
+            CREATE TABLE IF NOT EXISTS deep_read_messages (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                topic_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                status TEXT DEFAULT 'completed',
+                created_at TEXT,
+                FOREIGN KEY (session_id) REFERENCES deep_read_sessions(id)
+            );
+        """)
+        self._conn.commit()
+        # Add language column if missing (migration)
+        cols = {r[1] for r in self._conn.execute("PRAGMA table_info(deep_read_sessions)").fetchall()}
+        if "language" not in cols:
+            self._conn.execute("ALTER TABLE deep_read_sessions ADD COLUMN language TEXT DEFAULT 'en'")
+            self._conn.commit()
+        # Add code_review + repo_urls + repo_local_paths columns if missing (migration)
+        cols = {r[1] for r in self._conn.execute("PRAGMA table_info(deep_read_sessions)").fetchall()}
+        if "code_review" not in cols:
+            self._conn.execute("ALTER TABLE deep_read_sessions ADD COLUMN code_review TEXT DEFAULT ''")
+            self._conn.execute("ALTER TABLE deep_read_sessions ADD COLUMN repo_urls TEXT DEFAULT '[]'")
+            self._conn.execute("ALTER TABLE deep_read_sessions ADD COLUMN repo_local_paths TEXT DEFAULT '[]'")
+            self._conn.commit()
+        elif "repo_local_paths" not in cols:
+            self._conn.execute("ALTER TABLE deep_read_sessions ADD COLUMN repo_local_paths TEXT DEFAULT '[]'")
+            self._conn.commit()
 
     def _migrate_topic_sources(self) -> None:
         """Add OpenAlex/OpenReview columns to topics if missing."""
@@ -288,6 +344,8 @@ class Registry:
 
     def delete_topic(self, topic_id: str) -> None:
         with self._lock:
+            self._conn.execute("DELETE FROM deep_read_messages WHERE topic_id = ?", (topic_id,))
+            self._conn.execute("DELETE FROM deep_read_sessions WHERE topic_id = ?", (topic_id,))
             self._conn.execute("DELETE FROM chat_messages WHERE topic_id = ?", (topic_id,))
             self._conn.execute("DELETE FROM chat_sessions WHERE topic_id = ?", (topic_id,))
             self._conn.execute("DELETE FROM research_plans WHERE topic_id = ?", (topic_id,))
@@ -335,7 +393,7 @@ class Registry:
         return [dict(r) for r in rows]
 
     def update_session(self, topic_id: str, session_id: str, updates: dict) -> None:
-        allowed = {"status", "finished_at", "paper_count", "repo_count", "report_path", "insights_path"}
+        allowed = {"status", "finished_at", "paper_count", "repo_count", "report_path", "insights_path", "error_message"}
         fields = []
         params = []
         for key, val in updates.items():
@@ -696,6 +754,147 @@ class Registry:
             d["cited_papers"] = []
         return d
 
+    # ---- Deep Read Sessions ----
+
+    def create_deep_read_session(self, topic_id: str, paper_id: str, paper_title: str = "", language: str = "en") -> dict:
+        import uuid
+        session_id = f"dr-{uuid.uuid4().hex[:8]}"
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock:
+            self._conn.execute(
+                """INSERT INTO deep_read_sessions
+                   (id, topic_id, paper_id, paper_title, status, started_at, language)
+                   VALUES (?, ?, ?, ?, 'running', ?, ?)""",
+                (session_id, topic_id, paper_id, paper_title, now, language),
+            )
+            self._conn.commit()
+        return self.get_deep_read_session(topic_id, session_id)
+
+    def _parse_deep_read_row(self, row) -> dict:
+        """Parse a deep_read_sessions row, deserializing JSON fields."""
+        d = dict(row)
+        try:
+            d["summary_card_json"] = json.loads(d.get("summary_card_json", "{}") or "{}")
+        except (json.JSONDecodeError, TypeError):
+            d["summary_card_json"] = {}
+        for json_list_field in ("repo_urls", "repo_local_paths"):
+            try:
+                d[json_list_field] = json.loads(d.get(json_list_field, "[]") or "[]")
+            except (json.JSONDecodeError, TypeError):
+                d[json_list_field] = []
+        return d
+
+    def get_deep_read_session(self, topic_id: str, session_id: str) -> dict | None:
+        row = self._conn.execute(
+            "SELECT * FROM deep_read_sessions WHERE id = ? AND topic_id = ?",
+            (session_id, topic_id),
+        ).fetchone()
+        if not row:
+            return None
+        return self._parse_deep_read_row(row)
+
+    def list_deep_read_sessions(self, topic_id: str, paper_id: str | None = None) -> list[dict]:
+        if paper_id:
+            rows = self._conn.execute(
+                "SELECT * FROM deep_read_sessions WHERE topic_id = ? AND paper_id = ? ORDER BY started_at DESC",
+                (topic_id, paper_id),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT * FROM deep_read_sessions WHERE topic_id = ? ORDER BY started_at DESC",
+                (topic_id,),
+            ).fetchall()
+        return [self._parse_deep_read_row(row) for row in rows]
+
+    def update_deep_read_session(self, topic_id: str, session_id: str, updates: dict) -> None:
+        allowed = {
+            "status", "finished_at", "motivation_analysis", "method_analysis",
+            "experiment_analysis", "contribution_analysis", "summary_card_json",
+            "user_notes", "code_review", "repo_urls", "repo_local_paths",
+        }
+        fields = []
+        params = []
+        for key, val in updates.items():
+            if key in allowed:
+                fields.append(f"{key} = ?")
+                if key in ("summary_card_json", "repo_urls", "repo_local_paths") and not isinstance(val, str):
+                    params.append(json.dumps(val))
+                else:
+                    params.append(val)
+        if not fields:
+            return
+        params.extend([session_id, topic_id])
+        with self._lock:
+            self._conn.execute(
+                f"UPDATE deep_read_sessions SET {', '.join(fields)} WHERE id = ? AND topic_id = ?",
+                params,
+            )
+            self._conn.commit()
+
+    def delete_deep_read_session(self, topic_id: str, session_id: str) -> bool:
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM deep_read_messages WHERE session_id = ? AND topic_id = ?",
+                (session_id, topic_id),
+            )
+            cur = self._conn.execute(
+                "DELETE FROM deep_read_sessions WHERE id = ? AND topic_id = ?",
+                (session_id, topic_id),
+            )
+            self._conn.commit()
+            return cur.rowcount > 0
+
+    def add_deep_read_message(
+        self,
+        topic_id: str,
+        session_id: str,
+        role: str,
+        content: str,
+        status: str = "completed",
+    ) -> dict:
+        import uuid
+        msg_id = f"dm-{uuid.uuid4().hex[:8]}"
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock:
+            self._conn.execute(
+                """INSERT INTO deep_read_messages (id, session_id, topic_id, role, content, status, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (msg_id, session_id, topic_id, role, content, status, now),
+            )
+            self._conn.commit()
+        return self.get_deep_read_message(msg_id)
+
+    def list_deep_read_messages(self, topic_id: str, session_id: str) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT * FROM deep_read_messages WHERE session_id = ? AND topic_id = ? ORDER BY created_at ASC",
+            (session_id, topic_id),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def update_deep_read_message(self, msg_id: str, updates: dict) -> None:
+        allowed = {"content", "status"}
+        fields = []
+        params = []
+        for key, val in updates.items():
+            if key in allowed:
+                fields.append(f"{key} = ?")
+                params.append(val)
+        if not fields:
+            return
+        params.append(msg_id)
+        with self._lock:
+            self._conn.execute(
+                f"UPDATE deep_read_messages SET {', '.join(fields)} WHERE id = ?",
+                params,
+            )
+            self._conn.commit()
+
+    def get_deep_read_message(self, msg_id: str) -> dict | None:
+        row = self._conn.execute(
+            "SELECT * FROM deep_read_messages WHERE id = ?", (msg_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
     # ---- Translations ----
 
     def get_translation(
@@ -737,7 +936,11 @@ class Registry:
         with self._lock:
             # sessions
             cur = self._conn.execute(
-                "UPDATE sessions SET status = 'failed', finished_at = ? WHERE status = 'running'",
+                """UPDATE sessions
+                   SET status = 'failed',
+                       finished_at = ?,
+                       error_message = 'Interrupted: server process restarted while pipeline was running (likely hot-reload or crash).'
+                   WHERE status = 'running'""",
                 (now,),
             )
             counts["sessions"] = cur.rowcount
@@ -768,6 +971,19 @@ class Registry:
                 "UPDATE chat_messages SET status = 'failed' WHERE status IN ('pending', 'generating')",
             )
             counts["chat_messages"] = cur.rowcount
+
+            # deep_read_sessions
+            cur = self._conn.execute(
+                "UPDATE deep_read_sessions SET status = 'failed', finished_at = ? WHERE status = 'running'",
+                (now,),
+            )
+            counts["deep_read_sessions"] = cur.rowcount
+
+            # deep_read_messages (pending/generating → failed)
+            cur = self._conn.execute(
+                "UPDATE deep_read_messages SET status = 'failed' WHERE status IN ('pending', 'generating')",
+            )
+            counts["deep_read_messages"] = cur.rowcount
 
             self._conn.commit()
 

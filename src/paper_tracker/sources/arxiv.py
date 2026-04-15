@@ -11,6 +11,8 @@ from datetime import datetime, timedelta, timezone
 
 import httpx
 
+from paper_tracker.sources import httpx_get_with_retry
+
 log = logging.getLogger(__name__)
 
 _ARXIV_API = "https://export.arxiv.org/api/query"
@@ -69,6 +71,7 @@ def _parse_entries(root: ET.Element, cutoff: datetime, date_to: datetime | None 
             "math_concepts": [], # filled by summarizer
             "venue": "",         # filled by summarizer
             "cited_works": [],   # filled by summarizer
+            "doi": f"10.48550/arxiv.{arxiv_id}",  # synthesized arxiv DOI for cross-source dedup
         })
 
     return papers
@@ -113,8 +116,7 @@ def search(cfg: dict) -> list[dict]:
         }
 
         try:
-            resp = httpx.get(_ARXIV_API, params=params, timeout=30, follow_redirects=True)
-            resp.raise_for_status()
+            resp = httpx_get_with_retry(_ARXIV_API, params=params, timeout=30)
         except httpx.HTTPError as e:
             log.error("arXiv API request failed (start=%d): %s", start, e)
             break
@@ -165,8 +167,7 @@ def search_broad(
         }
 
         try:
-            resp = httpx.get(_ARXIV_API, params=params, timeout=30, follow_redirects=True)
-            resp.raise_for_status()
+            resp = httpx_get_with_retry(_ARXIV_API, params=params, timeout=30)
         except httpx.HTTPError as e:
             log.error("arXiv broad search page %d failed: %s", start, e)
             break
@@ -221,6 +222,7 @@ def _parse_entries_any(root: ET.Element) -> list[dict]:
             "math_concepts": [],
             "venue": "",
             "cited_works": [],
+            "doi": f"10.48550/arxiv.{arxiv_id}",
         })
     return papers
 
@@ -284,8 +286,7 @@ def search_random_era(
         }
 
         try:
-            resp = httpx.get(_ARXIV_API, params=params, timeout=30, follow_redirects=True)
-            resp.raise_for_status()
+            resp = httpx_get_with_retry(_ARXIV_API, params=params, timeout=30)
         except httpx.HTTPError as e:
             log.warning("arXiv era search %d-%02d failed: %s", year, month, e)
             time.sleep(_RATE_LIMIT_SECS)
@@ -341,8 +342,7 @@ def search_by_query(
     log.info("arXiv query search: %s (max=%d)", query, max_results)
 
     try:
-        resp = httpx.get(_ARXIV_API, params=params, timeout=30, follow_redirects=True)
-        resp.raise_for_status()
+        resp = httpx_get_with_retry(_ARXIV_API, params=params, timeout=30)
     except httpx.HTTPError as e:
         log.error("arXiv query search failed: %s", e)
         return []
