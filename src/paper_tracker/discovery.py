@@ -153,7 +153,7 @@ def run_trending(registry: Registry, cfg: dict) -> dict:
             source_stats=source_stats_text,
         )
 
-        raw = call_cli(prompt, cfg, timeout=360)
+        raw = call_cli(prompt, cfg, timeout=600)
         content = raw or "No trending themes could be generated."
 
         # Format as markdown report
@@ -319,6 +319,51 @@ Reply ONLY with a JSON object: {{"papers": [...], "synthesis": {{...}}}}
 No markdown fences."""
 
 
+def gather_cross_domain_papers(
+    categories: list[str] | None = None,
+    wildcard_categories: list[str] | None = None,
+    *,
+    lookback_days: int = 14,
+    max_recent: int = 100,
+    max_historical: int = 30,
+    max_wildcard: int = 15,
+) -> list[dict]:
+    """Collect theory papers from 3 pools — recent (``search_broad``), historical
+    random-era (``search_random_era``), and random wildcard categories — deduped
+    and ``pool``-tagged.
+
+    Shared by Math Insights discovery and the cross-domain knowledge-base
+    importer so both surface seminal/historical work, not just recent papers.
+    """
+    core_cats = categories or _MATH_CORE_CATEGORIES
+    wild_cats = wildcard_categories or _MATH_WILDCARD_CATEGORIES
+
+    recent_papers = search_broad(core_cats, lookback_days=lookback_days, max_results=max_recent)
+    for p in recent_papers:
+        p.setdefault("source", "arxiv")
+        p["pool"] = "recent"
+
+    historical_papers = search_random_era(core_cats, max_results=max_historical)
+    for p in historical_papers:
+        p.setdefault("source", "arxiv")
+        p["pool"] = "historical"
+
+    wildcard_cats = random.sample(wild_cats, min(4, len(wild_cats)))
+    wildcard_papers = search_random_era(wildcard_cats, max_results=max_wildcard)
+    for p in wildcard_papers:
+        p.setdefault("source", "arxiv")
+        p["pool"] = "wildcard"
+
+    seen: set[str] = set()
+    all_papers: list[dict] = []
+    for p in recent_papers + historical_papers + wildcard_papers:
+        aid = p.get("arxiv_id", "")
+        if aid and aid not in seen:
+            seen.add(aid)
+            all_papers.append(p)
+    return all_papers
+
+
 def run_math_insights(
     registry: Registry,
     cfg: dict,
@@ -353,33 +398,11 @@ def run_math_insights(
     report_id = report["id"]
 
     try:
-        # Pool 1: Recent papers from core math/stats categories
-        recent_papers = search_broad(core_cats, lookback_days=lb_days, max_results=mr_recent)
-        for p in recent_papers:
-            p.setdefault("source", "arxiv")
-            p["pool"] = "recent"
-
-        # Pool 2: Historical papers from random eras in core categories
-        historical_papers = search_random_era(core_cats, max_results=mr_historical)
-        for p in historical_papers:
-            p.setdefault("source", "arxiv")
-            p["pool"] = "historical"
-
-        # Pool 3: Wildcard — random era, random non-standard categories
-        wildcard_cats = random.sample(wild_cats, min(4, len(wild_cats)))
-        wildcard_papers = search_random_era(wildcard_cats, max_results=mr_wildcard)
-        for p in wildcard_papers:
-            p.setdefault("source", "arxiv")
-            p["pool"] = "wildcard"
-
-        # Deduplicate
-        seen: set[str] = set()
-        all_papers: list[dict] = []
-        for p in recent_papers + historical_papers + wildcard_papers:
-            aid = p.get("arxiv_id", "")
-            if aid and aid not in seen:
-                seen.add(aid)
-                all_papers.append(p)
+        all_papers = gather_cross_domain_papers(
+            core_cats, wild_cats,
+            lookback_days=lb_days, max_recent=mr_recent,
+            max_historical=mr_historical, max_wildcard=mr_wildcard,
+        )
 
         pool_counts = {
             "recent": sum(1 for p in all_papers if p.get("pool") == "recent"),
@@ -438,7 +461,7 @@ def run_math_insights(
             papers_text=papers_text,
         )
 
-        raw = call_cli(prompt, cfg, timeout=360)
+        raw = call_cli(prompt, cfg, timeout=600)
         content = raw or "No math insights could be generated."
 
         md = _format_math_markdown(content, all_papers, sampled)
@@ -727,7 +750,7 @@ def run_community_ideas(
             posts_text=posts_text,
         )
 
-        raw = call_cli(prompt, cfg, timeout=360)
+        raw = call_cli(prompt, cfg, timeout=600)
         content = raw or "No community ideas could be generated."
 
         md = _format_community_markdown(content, all_posts, source_counts)
@@ -991,7 +1014,7 @@ def review_discovery_report(registry: Registry, report_id: str, cfg: dict) -> di
             paper_count=report.get("paper_count", 0),
         )
 
-    raw = call_cli(prompt, cfg, timeout=120)
+    raw = call_cli(prompt, cfg, timeout=300)
 
     if not raw:
         result = {"quality_score": -1, "flags": [{"issue": "Review LLM call failed", "severity": "high"}], "summary": "Could not run quality review."}

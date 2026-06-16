@@ -68,6 +68,13 @@ def _paper_text(paper: dict) -> str:
         parts.append(paper["method"])
     if paper.get("contribution"):
         parts.append(paper["contribution"])
+    # Concept-card content (math summary + key concepts) — improves cross-domain
+    # retrieval for papers that have a card.
+    if paper.get("summary"):
+        parts.append(paper["summary"][:800])
+    mc = paper.get("math_concepts")
+    if mc:
+        parts.append(", ".join(mc) if isinstance(mc, list) else str(mc))
     return "\n".join(p for p in parts if p)
 
 

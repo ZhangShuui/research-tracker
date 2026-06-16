@@ -24,6 +24,8 @@ def load(path: Path | None = None) -> dict:
             p = _PROJECT_ROOT / p
         paths[key] = str(p)
     cfg["paths"] = paths
+    # Fill superpod defaults for any unset keys (host / project_root)
+    cfg["superpod"] = {**_default_superpod(), **cfg.get("superpod", {})}
     return cfg
 
 
@@ -44,6 +46,7 @@ def from_topic(topic: dict, base_cfg: dict | None = None) -> dict:
 
     return {
         "search": {
+            "description": topic.get("description", ""),
             "arxiv_keywords": topic.get("arxiv_keywords", []),
             "arxiv_categories": topic.get("arxiv_categories", []),
             "arxiv_lookback_days": topic.get("arxiv_lookback_days", 2),
@@ -63,6 +66,9 @@ def from_topic(topic: dict, base_cfg: dict | None = None) -> dict:
             # Global date range override (overrides lookback_days when set)
             "search_date_from": topic.get("search_date_from", ""),
             "search_date_to": topic.get("search_date_to", ""),
+            # Early relevance prefilter
+            "prefilter_enabled": topic.get("prefilter_enabled", True),
+            "prefilter_criteria": topic.get("prefilter_criteria", ""),
         },
         "summarizer": {**_default_summarizer(), **base_cfg.get("summarizer", {})},
         "notify": base_cfg.get("notify", {"toast": {"enabled": False}, "email": {"enabled": False}}),
@@ -77,13 +83,20 @@ def _default_summarizer() -> dict:
     return {
         "claude_path": "claude",
         "claude_timeout": 600,
-        "claude_model": "opus",
+        "claude_model": "sonnet",
         "codex_path": "codex",
         "codex_timeout": 600,
         "copilot_path": "copilot",
-        "copilot_timeout": 600,
-        "copilot_model": "gemini-3-pro-preview",
+        "copilot_timeout": 90,  # hard-capped at 90s in llm.call_copilot
+        "copilot_model": "gemini-3.1-pro-preview",
         "truncation_length": 300,
+    }
+
+
+def _default_superpod() -> dict:
+    return {
+        "host": "superpod",                     # ~/.ssh/config alias for the cluster
+        "project_root": "/project/visworld01",  # where reproduction work dirs are created
     }
 
 
@@ -95,5 +108,6 @@ def _default_base_cfg() -> dict:
             "reports_dir": str(_PROJECT_ROOT / "reports"),
         },
         "summarizer": _default_summarizer(),
+        "superpod": _default_superpod(),
         "notify": {"toast": {"enabled": False}, "email": {"enabled": False}},
     }

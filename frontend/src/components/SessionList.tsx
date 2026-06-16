@@ -94,11 +94,20 @@ export function SessionList({ sessions, onSelect, selectedId }: Props) {
                   <StatusBadge status={s.status} />
                 </td>
               </tr>
-              {s.status === "failed" && s.error_message && (
-                <tr className="bg-red-50/40">
+              {(s.status === "failed" || s.status === "partial") && s.error_message && (
+                <tr className={s.status === "partial" ? "bg-orange-50/40" : "bg-red-50/40"}>
                   <td colSpan={5} className="px-4 py-2.5">
-                    <div className="flex gap-2 items-start text-xs text-red-700">
-                      <AlertCircle size={13} className="mt-0.5 text-red-500 shrink-0" />
+                    <div
+                      className={`flex gap-2 items-start text-xs ${
+                        s.status === "partial" ? "text-orange-700" : "text-red-700"
+                      }`}
+                    >
+                      <AlertCircle
+                        size={13}
+                        className={`mt-0.5 shrink-0 ${
+                          s.status === "partial" ? "text-orange-500" : "text-red-500"
+                        }`}
+                      />
                       <pre className="whitespace-pre-wrap font-mono text-[11px] leading-relaxed break-all flex-1">
                         {s.error_message}
                       </pre>
@@ -133,6 +142,11 @@ function StatusBadge({ status }: { status: string }) {
       bg: "bg-red-50 border-red-200/60",
       dot: "bg-red-400",
       text: "text-red-600",
+    },
+    partial: {
+      bg: "bg-orange-50 border-orange-200/60",
+      dot: "bg-orange-400",
+      text: "text-orange-700",
     },
   };
   const style = map[status] ?? {

@@ -38,7 +38,8 @@ export interface Session {
   finished_at: string | null;
   paper_count: number;
   repo_count: number;
-  status: "running" | "completed" | "failed";
+  status: "running" | "completed" | "failed" | "partial";
+  kind?: "run" | "manual";
   report_path: string;
   insights_path: string;
   error_message?: string;
@@ -72,6 +73,94 @@ export interface PapersResponse {
   total: number;
   limit: number;
   offset: number;
+}
+
+export interface LookupPaper {
+  arxiv_id: string;
+  title: string;
+  authors: string;
+  abstract: string;
+  url: string;
+  published: string;
+  venue: string;
+}
+
+export interface PaperLookupResult {
+  found: boolean;
+  paper: LookupPaper | null;
+}
+
+export interface AddPaperBody {
+  arxiv_id?: string;
+  title: string;
+  authors?: string;
+  abstract?: string;
+  url?: string;
+  published?: string;
+  venue?: string;
+  summarize?: boolean;
+}
+
+export interface BatchAddResultItem {
+  query: string;
+  status: "added" | "duplicate" | "not_found" | "invalid" | "error";
+  arxiv_id?: string;
+  title?: string;
+}
+
+export interface BatchAddResponse {
+  results: BatchAddResultItem[];
+  counts: Record<string, number>;
+  summarizing: boolean;
+}
+
+export interface CrossDomainCandidate {
+  arxiv_id: string;
+  title: string;
+  authors: string;
+  abstract: string;
+  url: string;
+  published: string;
+  domain: string;
+  rationale: string;
+  source?: "kb" | "live";
+  score?: number;
+  /** True for serendipity picks: random math papers mixed in beyond the top-K. */
+  random?: boolean;
+}
+
+export interface CorpusAddResultItem {
+  query: string;
+  status: "added" | "skipped" | "duplicate" | "not_found" | "invalid" | "error";
+  arxiv_id?: string;
+  title?: string;
+  domain?: string;
+  reason?: string;
+}
+
+export interface CorpusAddResponse {
+  results: CorpusAddResultItem[];
+  counts: Record<string, number>;
+  embedding_started: boolean;
+}
+
+export interface ImportCandidate {
+  arxiv_id: string;
+  title: string;
+  authors: string;
+  abstract: string;
+  url: string;
+  published: string;
+  keep: boolean;
+  domain: string;
+  reason: string;
+}
+
+export interface CorpusEmbedJob {
+  status: string;
+  embedded?: number;
+  total?: number;
+  error?: string;
 }
 
 export interface ReposResponse {
@@ -210,6 +299,12 @@ export interface ContextOptions {
   use_citations?: boolean;
   use_questions?: boolean;
   use_novelty_map?: boolean;
+  /** Agentic idea generation: let the model look up cited papers' originals + search local/arXiv. */
+  agentic_retrieval?: boolean;
+  /** Agentic idea review: let the judge search prior work (arXiv + local) during review. */
+  agentic_review?: boolean;
+  /** Which insights memo (session id) to feed in; empty/undefined = latest. */
+  insights_session_id?: string;
 }
 
 export interface ChatSession {
@@ -389,6 +484,84 @@ export const api = {
       `/api/topics/${id}/insights`
     ),
 
+  suggestCrossDomain: (topicId: string, paperIds: string[], liveSearch = false) =>
+    req<{ candidates: CrossDomainCandidate[]; kb_count: number; live: boolean }>(
+      `/api/topics/${topicId}/insights/suggest-cross-domain`,
+      { method: "POST", body: JSON.stringify({ paper_ids: paperIds, live_search: liveSearch }) }
+    ),
+
+  // --- Cross-domain knowledge base (global corpus) ---
+  getCorpusPapers: (params?: { search?: string; limit?: number; offset?: number }) => {
+    const sp = new URLSearchParams();
+    if (params?.search) sp.set("search", params.search);
+    if (params?.limit) sp.set("limit", String(params.limit));
+    if (params?.offset) sp.set("offset", String(params.offset));
+    const qs = sp.toString();
+    return req<PapersResponse & { embedding_count: number; embedding_job: CorpusEmbedJob }>(
+      `/api/crossdomain/papers${qs ? `?${qs}` : ""}`
+    );
+  },
+
+  addCorpusPapers: (body: { text?: string; arxiv_ids?: string[]; skip_screen?: boolean }) =>
+    req<CorpusAddResponse>(`/api/crossdomain/papers`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+
+  importSearchCorpus: (body: { categories?: string[]; keyword?: string; max?: number }) =>
+    req<{ candidates: ImportCandidate[] }>(`/api/crossdomain/import-search`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+
+  deleteCorpusPaper: (arxivId: string) =>
+    req<void>(`/api/crossdomain/papers/${arxivId}`, { method: "DELETE" }),
+
+  getCorpusEmbeddingStatus: () =>
+    req<{ paper_count: number; embedding_count: number; job: CorpusEmbedJob }>(
+      `/api/crossdomain/embeddings`
+    ),
+
+  buildCorpusEmbeddings: () =>
+    req<{ status: string }>(`/api/crossdomain/embeddings`, { method: "POST" }),
+
+  importReportToCorpus: (reportId: string) =>
+    req<{ status: string; total: number }>(`/api/crossdomain/import-report`, {
+      method: "POST",
+      body: JSON.stringify({ report_id: reportId }),
+    }),
+
+  getCorpusImportStatus: () =>
+    req<{ job: { status: string; total?: number; added?: number; skipped?: number; processed?: number; duplicate?: number } }>(
+      `/api/crossdomain/import-report`
+    ),
+
+  buildConceptCards: (force = false) =>
+    req<{ status: string; total: number }>(`/api/crossdomain/concept-cards`, {
+      method: "POST",
+      body: JSON.stringify({ force }),
+    }),
+
+  getConceptCardsStatus: () =>
+    req<{ job: { status: string; total?: number; processed?: number; generated?: number } }>(
+      `/api/crossdomain/concept-cards`
+    ),
+
+  generateInsights: (
+    topicId: string,
+    body: {
+      paper_ids: string[];
+      cross_domain_papers?: CrossDomainCandidate[];
+      title?: string;
+      /** "single" = one opus call; "agentic" = multi-stage pipeline. */
+      mode?: "single" | "agentic";
+    }
+  ) =>
+    req<{ session_id: string; status: string }>(
+      `/api/topics/${topicId}/insights/generate`,
+      { method: "POST", body: JSON.stringify(body) }
+    ),
+
   // --- Papers / Repos ---
   getPapers: (topicId: string, params?: { search?: string; venue?: string; source?: string; date_from?: string; date_to?: string; limit?: number; offset?: number }) => {
     const sp = new URLSearchParams();
@@ -419,6 +592,35 @@ export const api = {
     req<{ topic_id: string; status: string; total: number; processed: number; removed: number }>(
       `/api/topics/${topicId}/papers/refilter`
     ),
+
+  backfillSummaries: (topicId: string) =>
+    req<{ status: string; topic_id: string; total: number }>(
+      `/api/topics/${topicId}/papers/backfill-summaries`,
+      { method: "POST" }
+    ),
+
+  getBackfillStatus: (topicId: string) =>
+    req<{ topic_id: string; status: string; total: number; processed: number }>(
+      `/api/topics/${topicId}/papers/backfill-summaries`
+    ),
+
+  lookupPaper: (topicId: string, query: string) =>
+    req<PaperLookupResult>(`/api/topics/${topicId}/papers/lookup`, {
+      method: "POST",
+      body: JSON.stringify({ query }),
+    }),
+
+  addPaper: (topicId: string, body: AddPaperBody) =>
+    req<{ paper: Paper; summarizing: boolean }>(`/api/topics/${topicId}/papers`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+
+  batchAddPapers: (topicId: string, body: { text: string; summarize?: boolean }) =>
+    req<BatchAddResponse>(`/api/topics/${topicId}/papers/batch`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
 
   getRepos: (topicId: string, limit = 50, offset = 0) =>
     req<ReposResponse>(`/api/topics/${topicId}/repos?limit=${limit}&offset=${offset}`),

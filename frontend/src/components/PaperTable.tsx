@@ -8,14 +8,17 @@ interface Props {
   onSelect: (paper: Paper) => void;
   onDelete?: (arxivId: string) => void;
   onDeepRead?: (arxivId: string) => void;
+  selectedIds?: Set<string>;
+  onToggleSelect?: (paper: Paper) => void;
 }
 
-export function PaperTable({ papers, onSelect, onDelete, onDeepRead }: Props) {
+export function PaperTable({ papers, onSelect, onDelete, onDeepRead, selectedIds, onToggleSelect }: Props) {
   return (
     <div className="overflow-x-auto">
       <table className="w-full text-sm">
         <thead>
           <tr className="text-left text-xs text-gray-500 border-b">
+            {onToggleSelect && <th className="pb-2 pr-2 font-medium w-6"></th>}
             <th className="pb-2 pr-3 font-medium">Title</th>
             <th className="pb-2 pr-3 font-medium w-32">Key Insight</th>
             <th className="pb-2 pr-3 font-medium w-20">Venue</th>
@@ -29,8 +32,21 @@ export function PaperTable({ papers, onSelect, onDelete, onDeepRead }: Props) {
             <tr
               key={p.arxiv_id}
               onClick={() => onSelect(p)}
-              className="border-b cursor-pointer hover:bg-gray-50 transition-colors"
+              className={`border-b cursor-pointer hover:bg-gray-50 transition-colors ${
+                selectedIds?.has(p.arxiv_id) ? "bg-indigo-50/60" : ""
+              }`}
             >
+              {onToggleSelect && (
+                <td className="py-2.5 pr-2" onClick={(e) => e.stopPropagation()}>
+                  <input
+                    type="checkbox"
+                    checked={selectedIds?.has(p.arxiv_id) ?? false}
+                    onChange={() => onToggleSelect(p)}
+                    className="rounded border-gray-300 cursor-pointer"
+                    title="Select for insights"
+                  />
+                </td>
+              )}
               <td className="py-2.5 pr-3">
                 <span className="text-gray-900 line-clamp-1 font-medium">
                   {p.title}

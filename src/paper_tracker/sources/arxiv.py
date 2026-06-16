@@ -118,8 +118,14 @@ def search(cfg: dict) -> list[dict]:
         try:
             resp = httpx_get_with_retry(_ARXIV_API, params=params, timeout=30)
         except httpx.HTTPError as e:
+            # Partial failure (some pages already fetched): keep what we have.
+            # Total failure (first request): re-raise so the pipeline can mark
+            # the source as FAILED instead of silently reporting "0 papers".
+            if all_papers:
+                log.warning("arXiv pagination stopped early at start=%d: %s", start, e)
+                break
             log.error("arXiv API request failed (start=%d): %s", start, e)
-            break
+            raise
 
         root = ET.fromstring(resp.text)
         page_papers = _parse_entries(root, cutoff, date_to_dt)
@@ -354,3 +360,96 @@ def search_by_query(
 
     log.info("arXiv query search returned %d papers", len(papers))
     return papers
+
+
+_ARXIV_ID_NEW = re.compile(r"(\d{4}\.\d{4,5})(v\d+)?")
+_ARXIV_ID_OLD = re.compile(r"([a-z-]+(?:\.[A-Z]{2})?/\d{7})(v\d+)?")
+
+
+def extract_arxiv_id(value: str) -> str:
+    """Extract a bare arXiv ID from a raw ID string or a URL.
+
+    Accepts ``2401.12345``, ``2401.12345v2``, ``arXiv:2401.12345``,
+    ``https://arxiv.org/abs/2401.12345`` and ``.../pdf/2401.12345.pdf`` (and
+    legacy ``hep-th/9901001`` style). Returns the version-stripped ID, or ""
+    when nothing parseable is found.
+    """
+    if not value:
+        return ""
+    s = re.sub(r"(?i)^\s*arxiv:\s*", "", value.strip())
+    m = _ARXIV_ID_NEW.search(s) or _ARXIV_ID_OLD.search(s)
+    return m.group(1) if m else ""
+
+
+def fetch_by_id(arxiv_id: str) -> dict | None:
+    """Fetch one paper's metadata from arXiv by ID (accepts a raw ID or URL).
+
+    Returns the standard paper dict with ``published`` normalized to
+    ``YYYY-MM-DD``, or ``None`` if the input is unparseable or arXiv has no
+    matching entry. Raises ``httpx.HTTPError`` if the API request itself fails.
+    """
+    clean = extract_arxiv_id(arxiv_id)
+    if not clean:
+        return None
+
+    log.info("arXiv fetch_by_id: %s", clean)
+    resp = httpx_get_with_retry(
+        _ARXIV_API, params={"id_list": clean, "max_results": 1}, timeout=30
+    )
+    papers = _parse_entries_any(ET.fromstring(resp.text))
+    if not papers:
+        return None
+
+    paper = papers[0]
+    # arXiv returns an "Error" Atom entry (with a non-matching id) for unknown
+    # IDs; treat anything that doesn't echo back the requested id as not found.
+    if paper["arxiv_id"] != clean:
+        log.warning("arXiv fetch_by_id(%s) returned non-matching id %s",
+                    clean, paper["arxiv_id"])
+        return None
+
+    # _parse_entries_any leaves published as the raw Atom timestamp; the rest of
+    # the app stores YYYY-MM-DD.
+    if paper.get("published"):
+        paper["published"] = paper["published"][:10]
+    return paper
+
+
+_FETCH_MANY_CHUNK = 50
+
+
+def fetch_many_by_id(arxiv_ids: list[str]) -> dict[str, dict]:
+    """Fetch metadata for many arXiv IDs in as few requests as possible.
+
+    Accepts raw IDs or URLs; cleans + dedups them and queries the API's
+    ``id_list`` (comma-joined) in chunks, so a typical batch is a single
+    request. Returns ``{cleaned_id: paper}`` for entries found (``published``
+    normalized to ``YYYY-MM-DD``); unknown IDs are simply absent. Raises
+    ``httpx.HTTPError`` if a request fails.
+    """
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for raw in arxiv_ids:
+        cid = extract_arxiv_id(raw)
+        if cid and cid not in seen:
+            seen.add(cid)
+            cleaned.append(cid)
+    if not cleaned:
+        return {}
+
+    out: dict[str, dict] = {}
+    for i in range(0, len(cleaned), _FETCH_MANY_CHUNK):
+        chunk = cleaned[i : i + _FETCH_MANY_CHUNK]
+        log.info("arXiv fetch_many_by_id: %d ids", len(chunk))
+        resp = httpx_get_with_retry(
+            _ARXIV_API,
+            params={"id_list": ",".join(chunk), "max_results": len(chunk)},
+            timeout=60,
+        )
+        for paper in _parse_entries_any(ET.fromstring(resp.text)):
+            if paper.get("published"):
+                paper["published"] = paper["published"][:10]
+            out[paper["arxiv_id"]] = paper
+        if i + _FETCH_MANY_CHUNK < len(cleaned):
+            time.sleep(_RATE_LIMIT_SECS)
+    return out

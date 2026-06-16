@@ -2,27 +2,34 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import httpx
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, field_validator
 
 from paper_tracker import config as cfg_module
+from paper_tracker import crossdomain
+from paper_tracker import insights
+from paper_tracker import rag
 from paper_tracker.brainstorm import run_brainstorm, check_prior_art
 from paper_tracker.chat import generate_chat_response
-from paper_tracker.discovery import run_trending, run_math_insights, run_community_ideas, review_discovery_report
+from paper_tracker.discovery import run_trending, run_math_insights, run_community_ideas, review_discovery_report, gather_cross_domain_papers
 from paper_tracker.research_plan import generate_research_plan, refine_research_plan
 from paper_tracker.registry import Registry
 from paper_tracker.scheduler import Scheduler
+from paper_tracker.sources import arxiv, pdf as pdf_source
 from paper_tracker.storage import Storage
-from paper_tracker.summarizer import refilter_papers
+from paper_tracker.summarizer import refilter_papers, summarize_papers
 
 log = logging.getLogger(__name__)
 
@@ -147,6 +154,9 @@ class TopicCreate(BaseModel):
     # Date range override
     search_date_from: str = ""
     search_date_to: str = ""
+    # Early relevance prefilter
+    prefilter_enabled: bool = True
+    prefilter_criteria: str = ""
 
     @field_validator("name")
     @classmethod
@@ -187,6 +197,9 @@ class TopicUpdate(BaseModel):
     # Date range override
     search_date_from: str | None = None
     search_date_to: str | None = None
+    # Early relevance prefilter
+    prefilter_enabled: bool | None = None
+    prefilter_criteria: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -235,8 +248,8 @@ Generate a JSON object with:
 
 Output ONLY the JSON object, no markdown fences, no explanation."""
 
-    cfg = {"summarizer": {"claude_path": "claude", "claude_model": "sonnet", "claude_timeout": 60}}
-    raw = call_cli(prompt, cfg, model="sonnet", timeout=60)
+    cfg = {"summarizer": {"claude_path": "claude", "claude_model": "sonnet", "claude_timeout": 300}}
+    raw = call_cli(prompt, cfg, model="sonnet", timeout=300)
     if raw:
         # Strip markdown fences if present
         raw = raw.strip()
@@ -514,6 +527,139 @@ async def get_latest_insights(topic_id: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Generate insights from selected papers (manual, cross-domain enrichment)
+# ---------------------------------------------------------------------------
+
+class SuggestCrossDomainRequest(BaseModel):
+    paper_ids: list[str]
+    live_search: bool = False  # also run live arXiv keyword search (opt-in)
+
+
+class CrossDomainPaperIn(BaseModel):
+    arxiv_id: str = ""
+    title: str = ""
+    authors: str = ""
+    abstract: str = ""
+    url: str = ""
+    published: str = ""
+    domain: str = ""
+
+
+class GenerateInsightsRequest(BaseModel):
+    paper_ids: list[str]
+    cross_domain_papers: list[CrossDomainPaperIn] = []
+    title: str = ""
+    mode: str = "single"  # "single" (one-call) or "agentic" (multi-stage pipeline)
+
+
+@app.post("/api/topics/{topic_id}/insights/suggest-cross-domain")
+async def suggest_cross_domain_route(topic_id: str, body: SuggestCrossDomainRequest) -> dict:
+    """Suggest cross-domain papers to enrich a selection (opus + arXiv). Synchronous."""
+    reg = _get_registry()
+    topic = reg.get_topic(topic_id)
+    if not topic:
+        raise HTTPException(404, detail="Topic not found")
+    if not body.paper_ids:
+        raise HTTPException(400, detail="paper_ids is required")
+    store = Storage(_data_dir, topic_id)
+    try:
+        selected = [p for p in (store.get_arxiv(pid) for pid in body.paper_ids) if p]
+    finally:
+        store.close()
+    if not selected:
+        raise HTTPException(400, detail="None of the selected papers were found")
+
+    # 1. Curated knowledge base via vector retrieval (default smart path).
+    corpus = _corpus_store()
+    try:
+        kb = crossdomain.retrieve(selected, corpus, k=12)
+    finally:
+        corpus.close()
+
+    candidates = list(kb)
+    seen = {c["arxiv_id"] for c in candidates}
+
+    # 2. Optional live arXiv keyword search (manual toggle).
+    if body.live_search:
+        topic_cfg = cfg_module.from_topic(topic, _base_cfg)
+        for c in insights.suggest_cross_domain(selected, topic["name"], topic_cfg):
+            if c.get("arxiv_id") in seen:
+                continue
+            seen.add(c["arxiv_id"])
+            candidates.append({**c, "source": "live"})
+
+    return {"candidates": candidates, "kb_count": len(kb), "live": bool(body.live_search)}
+
+
+@app.post("/api/topics/{topic_id}/insights/generate", status_code=202)
+async def generate_insights_route(topic_id: str, body: GenerateInsightsRequest) -> dict:
+    """Generate an insights memo from selected (+ chosen cross-domain) papers.
+
+    Creates a ``kind='manual'`` session and runs insights.generate in the
+    background; poll GET .../sessions/{session_id} until status != 'running'.
+    """
+    reg = _get_registry()
+    topic = reg.get_topic(topic_id)
+    if not topic:
+        raise HTTPException(404, detail="Topic not found")
+    if not body.paper_ids:
+        raise HTTPException(400, detail="paper_ids is required")
+
+    session = reg.create_session(topic_id, kind="manual")
+    sid = session["id"]
+    session_dir = Path(_data_dir) / topic_id / "sessions" / sid
+    topic_cfg = cfg_module.from_topic(topic, _base_cfg)
+    topic_name = topic["name"]
+    paper_ids = list(body.paper_ids)
+    cross = [c.model_dump() for c in body.cross_domain_papers]
+    mode = "agentic" if body.mode == "agentic" else "single"
+
+    def _finish(updates: dict) -> None:
+        updates["finished_at"] = datetime.now(timezone.utc).isoformat()
+        reg.update_session(topic_id, sid, updates)
+
+    def _run():
+        store = Storage(_data_dir, topic_id)
+        try:
+            papers = [p for p in (store.get_arxiv(pid) for pid in paper_ids) if p]
+            for c in cross:
+                papers.append({
+                    "arxiv_id": c.get("arxiv_id", ""),
+                    "title": c.get("title", ""),
+                    "authors": c.get("authors", ""),
+                    "venue": c.get("domain", ""),
+                    "abstract": c.get("abstract", ""),
+                    "summary": c.get("abstract", ""),  # abstract stands in as summary
+                    "key_insight": "", "method": "", "contribution": "",
+                    "math_concepts": [],
+                })
+            if not papers:
+                _finish({"status": "failed", "error_message": "No papers found"})
+                return
+            if mode == "agentic":
+                path = insights.generate_agentic(
+                    papers, topic_name, session_dir, topic_cfg,
+                    progress_cb=lambda msg: log.info("insights[%s] %s", sid, msg),
+                )
+            else:
+                path = insights.generate(papers, topic_name, session_dir, topic_cfg)
+            if path:
+                _finish({"status": "completed", "insights_path": str(path),
+                         "paper_count": len(papers)})
+            else:
+                _finish({"status": "failed",
+                         "error_message": "Insights generation failed"})
+        except Exception as e:
+            log.exception("Manual insights generation failed: %s", e)
+            _finish({"status": "failed", "error_message": str(e)})
+        finally:
+            store.close()
+
+    _brainstorm_executor.submit(_run)
+    return {"session_id": sid, "status": "running"}
+
+
+# ---------------------------------------------------------------------------
 # Papers / Repos endpoints (per-topic paper library)
 # ---------------------------------------------------------------------------
 
@@ -624,6 +770,819 @@ async def get_refilter_status(topic_id: str) -> dict:
         raise HTTPException(404, detail="Topic not found")
     job = _refilter_jobs.get(topic_id, {"status": "idle", "total": 0, "processed": 0, "removed": 0})
     return {"topic_id": topic_id, **job}
+
+
+# ---------------------------------------------------------------------------
+# Backfill missing summaries (manual/seeded/batch-added papers have none)
+# ---------------------------------------------------------------------------
+
+_summary_backfill_jobs: dict[str, dict] = {}
+_BACKFILL_CHUNK = 10
+
+
+def _needs_summary(p: dict) -> bool:
+    """A paper is unsummarized if it has no key_insight (pipeline papers do)."""
+    return not (p.get("key_insight") or "").strip()
+
+
+@app.post("/api/topics/{topic_id}/papers/backfill-summaries", status_code=202)
+async def start_backfill_summaries(topic_id: str) -> dict:
+    """Scan the library and summarize papers that have no summary yet (sonnet,
+    background, batched). Poll GET for {status,total,processed}."""
+    reg = _get_registry()
+    topic = reg.get_topic(topic_id)
+    if not topic:
+        raise HTTPException(404, detail="Topic not found")
+    if _summary_backfill_jobs.get(topic_id, {}).get("status") == "running":
+        raise HTTPException(409, detail="Summary backfill already running for this topic")
+
+    store = Storage(_data_dir, topic_id)
+    try:
+        papers, _ = store.get_all_arxiv(limit=10000, offset=0)
+    finally:
+        store.close()
+    missing_ids = [p["arxiv_id"] for p in papers if _needs_summary(p)]
+
+    if not missing_ids:
+        _summary_backfill_jobs[topic_id] = {"status": "completed", "total": 0, "processed": 0}
+        return {"status": "completed", "topic_id": topic_id, "total": 0, "processed": 0}
+
+    _summary_backfill_jobs[topic_id] = {
+        "status": "running", "total": len(missing_ids), "processed": 0,
+    }
+    topic_cfg = cfg_module.from_topic(topic, _base_cfg)
+
+    def _run():
+        job = _summary_backfill_jobs[topic_id]
+        store = Storage(_data_dir, topic_id)
+        try:
+            for i in range(0, len(missing_ids), _BACKFILL_CHUNK):
+                chunk_ids = missing_ids[i : i + _BACKFILL_CHUNK]
+                chunk = [p for p in (store.get_arxiv(a) for a in chunk_ids) if p]
+                if chunk:
+                    summarize_papers(chunk, topic_cfg)  # batches internally
+                    for p in chunk:
+                        store.update_arxiv_summary(p["arxiv_id"], {
+                            "summary": p.get("summary", ""),
+                            "key_insight": p.get("key_insight", ""),
+                            "method": p.get("method", ""),
+                            "contribution": p.get("contribution", ""),
+                            "math_concepts": p.get("math_concepts", []),
+                            "venue": p.get("venue", ""),
+                            "cited_works": p.get("cited_works", []),
+                        })
+                job["processed"] = min(job["total"], i + len(chunk_ids))
+            job["status"] = "completed"
+        except Exception as e:
+            log.exception("Summary backfill failed: %s", e)
+            job["status"] = "failed"
+        finally:
+            store.close()
+
+    _brainstorm_executor.submit(_run)
+    return {"status": "started", "topic_id": topic_id, "total": len(missing_ids)}
+
+
+@app.get("/api/topics/{topic_id}/papers/backfill-summaries")
+async def get_backfill_summaries_status(topic_id: str) -> dict:
+    reg = _get_registry()
+    if not reg.get_topic(topic_id):
+        raise HTTPException(404, detail="Topic not found")
+    job = _summary_backfill_jobs.get(topic_id, {"status": "idle", "total": 0, "processed": 0})
+    return {"topic_id": topic_id, **job}
+
+
+# ---------------------------------------------------------------------------
+# Cross-domain knowledge base (global curated corpus: screen + vector retrieval)
+# ---------------------------------------------------------------------------
+
+_corpus_embed_jobs: dict = {}  # keyed by "corpus"
+
+
+def _corpus_store() -> Storage:
+    return Storage(_data_dir, crossdomain.CROSSDOMAIN_ID)
+
+
+def _corpus_insert(store: Storage, meta: dict, domain: str, reason: str) -> str:
+    """Insert a paper (from any source) into the corpus. Returns its key.
+
+    Uses the source's own ``paper_id``/``doi`` (arXiv id, ``doi:…``, ``oa:…``,
+    ``pdf:…``) so non-arXiv work is stored correctly.
+    """
+    key = meta.get("paper_id") or meta["arxiv_id"]
+    store.insert_arxiv({
+        "arxiv_id": key, "paper_id": key, "source": "crossdomain",
+        "title": meta.get("title", ""), "authors": meta.get("authors", ""),
+        "abstract": meta.get("abstract", ""),
+        "url": meta.get("url", ""),
+        "published": (meta.get("published", "") or "")[:10],
+        "summary": meta.get("summary") or meta.get("abstract", ""),  # feeds embed text
+        "key_insight": reason, "method": "", "contribution": "",
+        "math_concepts": [], "venue": domain or meta.get("venue", ""), "cited_works": [],
+        "quality_score": 0, "citation_count": meta.get("citation_count", 0),
+        "doi": meta.get("doi", ""),
+    })
+    return key
+
+
+def _submit_corpus_embed_job() -> None:
+    if _corpus_embed_jobs.get("corpus", {}).get("status") == "running":
+        return
+    _corpus_embed_jobs["corpus"] = {"status": "running", "embedded": 0}
+
+    def _run():
+        store = _corpus_store()
+        try:
+            n = rag.ensure_embeddings(store)
+            _corpus_embed_jobs["corpus"] = {
+                "status": "completed", "embedded": n, "total": store.embedding_count(),
+            }
+        except Exception as e:
+            log.exception("Corpus embedding failed: %s", e)
+            _corpus_embed_jobs["corpus"] = {"status": "failed", "embedded": 0, "error": str(e)}
+        finally:
+            store.close()
+
+    _brainstorm_executor.submit(_run)
+
+
+class CorpusAddRequest(BaseModel):
+    text: str = ""
+    arxiv_ids: list[str] = []
+    skip_screen: bool = False
+
+
+class CorpusImportRequest(BaseModel):
+    categories: list[str] = []
+    keyword: str = ""
+    max: int = 30
+
+
+@app.get("/api/crossdomain/papers")
+async def list_corpus_papers(
+    search: str = Query(default=""),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+) -> dict:
+    store = _corpus_store()
+    try:
+        papers, total = store.get_all_arxiv(search=search, limit=limit, offset=offset)
+        emb = store.embedding_count()
+    finally:
+        store.close()
+    return {
+        "papers": papers, "total": total, "limit": limit, "offset": offset,
+        "embedding_count": emb,
+        "embedding_job": _corpus_embed_jobs.get("corpus", {"status": "idle"}),
+    }
+
+
+@app.post("/api/crossdomain/papers", status_code=201)
+async def add_corpus_papers(body: CorpusAddRequest) -> dict:
+    """Add papers to the corpus from pasted IDs/URLs or an explicit id list.
+
+    Each is screened (opus) unless ``skip_screen``; kept papers are inserted and
+    a background embedding job is kicked. Per-item: added | skipped(reason) |
+    duplicate | not_found | invalid | error.
+    """
+    tokens = [t for t in re.split(r"[\s,]+", body.text.strip()) if t]
+    tokens += [s.strip() for s in body.arxiv_ids if s.strip()]
+    if not tokens:
+        raise HTTPException(400, detail="No URLs or arXiv IDs provided")
+    seen_tok: set[str] = set()
+    uniq = [t for t in tokens if not (t in seen_tok or seen_tok.add(t))]
+
+    results: list[dict] = []
+    added_ids: list[str] = []
+    store = _corpus_store()
+    try:
+        # Classify each token: arXiv id/URL, PDF URL, or invalid.
+        pending: list[tuple[str, str, str]] = []  # (token, kind, key)
+        for tok in uniq:
+            cid = arxiv.extract_arxiv_id(tok)
+            if cid:
+                kind, key, doi = "arxiv", cid, f"10.48550/arxiv.{cid}"
+            elif pdf_source.is_pdf_url(tok):
+                kind = "pdf"
+                key = "pdf:" + hashlib.sha1(tok.strip().encode()).hexdigest()[:12]
+                doi = ""
+            else:
+                results.append({"query": tok, "status": "invalid"})
+                continue
+            if store.is_paper_seen(key, doi):
+                results.append({"query": tok, "status": "duplicate", "arxiv_id": key})
+                continue
+            pending.append((tok, kind, key))
+
+        # Fetch metadata: arXiv in one batch, PDFs individually.
+        arxiv_keys = [k for _, kind, k in pending if kind == "arxiv"]
+        fetched: dict[str, dict] = {}
+        fetch_failed = False
+        if arxiv_keys:
+            try:
+                fetched = arxiv.fetch_many_by_id(arxiv_keys)
+            except httpx.HTTPError as e:
+                log.warning("Corpus add: arXiv fetch failed: %s", e)
+                fetch_failed = True
+
+        to_consider: list[tuple[str, dict]] = []  # (token, meta)
+        for tok, kind, key in pending:
+            if kind == "arxiv":
+                if fetch_failed:
+                    results.append({"query": tok, "status": "error", "arxiv_id": key})
+                    continue
+                meta = fetched.get(key)
+            else:  # pdf — download + parse + LLM-extract metadata
+                meta = pdf_source.fetch_pdf_paper(tok, _base_cfg)
+            if not meta:
+                results.append({"query": tok, "status": "not_found", "arxiv_id": key})
+                continue
+            to_consider.append((tok, meta))
+
+        vmap: dict[str, dict] = {}
+        if to_consider and not body.skip_screen:
+            verdicts = crossdomain.screen_papers([m for _, m in to_consider], _base_cfg)
+            vmap = {v["arxiv_id"]: v for v in verdicts}
+
+        for tok, meta in to_consider:
+            mkey = meta.get("paper_id") or meta["arxiv_id"]  # source's own id
+            keep, domain, reason = True, "", ""
+            if not body.skip_screen:
+                v = vmap.get(mkey, {})
+                keep, domain, reason = v.get("keep", True), v.get("domain", ""), v.get("reason", "")
+            if mkey in added_ids:
+                results.append({"query": tok, "status": "duplicate", "arxiv_id": mkey})
+                continue
+            if not keep:
+                results.append({"query": tok, "status": "skipped", "arxiv_id": mkey,
+                                "reason": reason, "title": meta.get("title", "")})
+                continue
+            _corpus_insert(store, meta, domain, reason)
+            added_ids.append(mkey)
+            results.append({"query": tok, "status": "added", "arxiv_id": mkey,
+                            "title": meta.get("title", ""), "domain": domain})
+    finally:
+        store.close()
+
+    if added_ids:
+        _submit_corpus_embed_job()
+
+    counts = {k: sum(1 for r in results if r["status"] == k)
+              for k in ("added", "skipped", "duplicate", "not_found", "invalid", "error")}
+    return {"results": results, "counts": counts, "embedding_started": bool(added_ids)}
+
+
+@app.post("/api/crossdomain/import-search")
+async def corpus_import_search(body: CorpusImportRequest) -> dict:
+    """Find candidate corpus papers by arXiv category (or keyword), screen them,
+    and return for review (NOT saved). Confirm by POSTing the chosen ids to
+    /api/crossdomain/papers with skip_screen=true."""
+    cats = [c.strip() for c in body.categories if c.strip()] or crossdomain.DEFAULT_IMPORT_CATEGORIES
+    kw = body.keyword.strip()
+    maxn = max(1, min(body.max, 100))
+    try:
+        if kw:
+            # keyword → all-time relevance search (good for seminal work by concept)
+            papers = arxiv.search_by_query(kw, max_results=maxn)
+        else:
+            # 3-pool gather (recent + historical/seminal + wildcard) — shared with
+            # Math Insights so the importer surfaces classic theory, not just recent.
+            r = max(1, maxn // 2)
+            h = max(1, maxn // 3)
+            papers = gather_cross_domain_papers(
+                cats, lookback_days=365,
+                max_recent=r, max_historical=h, max_wildcard=max(1, maxn - r - h),
+            )
+    except Exception as e:
+        log.warning("Corpus import search failed: %s", e)
+        raise HTTPException(502, detail="arXiv search failed; please try again.")
+
+    store = _corpus_store()
+    try:
+        papers = [p for p in papers
+                  if not store.is_paper_seen(p.get("paper_id", p["arxiv_id"]), p.get("doi", ""))]
+    finally:
+        store.close()
+    if not papers:
+        return {"candidates": []}
+
+    verdicts = crossdomain.screen_papers(papers, _base_cfg)
+    vmap = {v["arxiv_id"]: v for v in verdicts}
+    candidates = [{
+        "arxiv_id": p["arxiv_id"], "title": p.get("title", ""), "authors": p.get("authors", ""),
+        "abstract": p.get("abstract", ""), "url": p.get("url", ""),
+        "published": (p.get("published", "") or "")[:10],
+        "keep": bool(vmap.get(p["arxiv_id"], {}).get("keep", False)),
+        "domain": vmap.get(p["arxiv_id"], {}).get("domain", ""),
+        "reason": vmap.get(p["arxiv_id"], {}).get("reason", ""),
+    } for p in papers]
+    return {"candidates": candidates}
+
+
+@app.delete("/api/crossdomain/papers/{arxiv_id:path}", status_code=204)
+async def delete_corpus_paper(arxiv_id: str) -> None:
+    store = _corpus_store()
+    try:
+        deleted = store.delete_arxiv(arxiv_id)
+        store.delete_embedding(arxiv_id)
+    finally:
+        store.close()
+    if not deleted:
+        raise HTTPException(404, detail="Paper not found")
+
+
+@app.post("/api/crossdomain/embeddings", status_code=202)
+async def build_corpus_embeddings() -> dict:
+    _submit_corpus_embed_job()
+    return {"status": "started"}
+
+
+@app.get("/api/crossdomain/embeddings")
+async def get_corpus_embeddings_status() -> dict:
+    store = _corpus_store()
+    try:
+        _, total = store.get_all_arxiv(limit=1, offset=0)
+        emb = store.embedding_count()
+    finally:
+        store.close()
+    return {"paper_count": total, "embedding_count": emb,
+            "job": _corpus_embed_jobs.get("corpus", {"status": "idle"})}
+
+
+_corpus_import_jobs: dict = {}  # keyed by "import"
+
+
+class ImportReportRequest(BaseModel):
+    report_id: str
+
+
+@app.post("/api/crossdomain/import-report", status_code=202)
+async def import_report_to_corpus(body: ImportReportRequest) -> dict:
+    """Promote a discovery report's papers (e.g. Math Insights) into the corpus:
+    fetch metadata → screen → insert kept → embed, in the background."""
+    reg = _get_registry()
+    report = reg.get_discovery_report(body.report_id)
+    if not report:
+        raise HTTPException(404, detail="Report not found")
+    if _corpus_import_jobs.get("import", {}).get("status") == "running":
+        raise HTTPException(409, detail="A corpus import is already running")
+
+    pj = report.get("papers_json") or []
+    if isinstance(pj, str):
+        try:
+            pj = json.loads(pj)
+        except (json.JSONDecodeError, TypeError):
+            pj = []
+    ids = [p["arxiv_id"] for p in pj if isinstance(p, dict) and p.get("arxiv_id")]
+    if not ids:
+        raise HTTPException(400, detail="Report has no papers to import")
+
+    _corpus_import_jobs["import"] = {"status": "running", "total": len(ids),
+                                     "added": 0, "skipped": 0, "processed": 0, "duplicate": 0}
+    cfg = _base_cfg
+
+    def _run():
+        job = _corpus_import_jobs["import"]
+        store = _corpus_store()
+        try:
+            todo = [i for i in ids if not store.is_paper_seen(i, f"10.48550/arxiv.{i}")]
+            job["duplicate"] = len(ids) - len(todo)
+            job["total"] = len(todo)
+            added = skipped = processed = 0
+            CHUNK = 40
+            for s in range(0, len(todo), CHUNK):
+                chunk_ids = todo[s : s + CHUNK]
+                try:
+                    fetched = arxiv.fetch_many_by_id(chunk_ids)
+                except httpx.HTTPError as e:
+                    log.warning("import-report fetch failed: %s", e)
+                    fetched = {}
+                metas = [fetched[i] for i in chunk_ids if i in fetched]
+                if metas:
+                    verdicts = {v["arxiv_id"]: v for v in crossdomain.screen_papers(metas, cfg)}
+                    for m in metas:
+                        v = verdicts.get(m["arxiv_id"], {})
+                        if v.get("keep", True):
+                            _corpus_insert(store, m, v.get("domain", ""), v.get("reason", ""))
+                            added += 1
+                        else:
+                            skipped += 1
+                processed += len(chunk_ids)
+                job.update({"added": added, "skipped": skipped, "processed": processed})
+            try:
+                rag.ensure_embeddings(store)
+            except Exception as e:
+                log.warning("import-report embed failed: %s", e)
+            job.update({"status": "completed", "added": added, "skipped": skipped, "processed": len(todo)})
+        except Exception as e:
+            log.exception("import-report failed: %s", e)
+            job["status"] = "failed"
+        finally:
+            store.close()
+
+    _brainstorm_executor.submit(_run)
+    return {"status": "started", "total": len(ids)}
+
+
+@app.get("/api/crossdomain/import-report")
+async def get_import_report_status() -> dict:
+    return {"job": _corpus_import_jobs.get("import", {"status": "idle"})}
+
+
+_corpus_card_jobs: dict = {}  # keyed by "cards"
+
+
+class ConceptCardsRequest(BaseModel):
+    force: bool = False  # regenerate even for papers that already have a card
+
+
+_CARD_PDF_MAX_PAGES = 400   # bound text extraction for very long books
+_LONG_DOC_CHARS = 16000     # above this, split a PDF into per-section cards
+
+
+def _insert_card_child(store: Storage, child_id: str, parent: dict, title: str, card: dict) -> None:
+    store.insert_arxiv({
+        "arxiv_id": child_id, "paper_id": child_id, "source": "crossdomain",
+        "title": title[:300], "authors": parent.get("authors", ""),
+        "abstract": card["summary"], "url": parent.get("url", ""),
+        "published": parent.get("published", ""), "summary": card["summary"],
+        "key_insight": parent.get("key_insight", ""), "method": "", "contribution": "",
+        "math_concepts": card["math_concepts"], "venue": parent.get("venue", ""),
+        "cited_works": [], "quality_score": 0, "citation_count": 0, "doi": "",
+    })
+
+
+def _single_card(store: Storage, aid: str, paper: dict, cfg: dict, text: str | None = None) -> bool:
+    card = crossdomain.generate_concept_card(paper, cfg, text=text)
+    if not card:
+        return False
+    store.update_arxiv_summary(aid, {"summary": card["summary"], "math_concepts": card["math_concepts"]})
+    store.delete_embedding(aid)  # force re-embed with card text
+    return True
+
+
+def _card_one_paper(store: Storage, aid: str, cfg: dict) -> int:
+    """Generate concept card(s) for one corpus paper; returns the # of cards made.
+
+    A long top-level PDF is split into per-section CHILD entries (C: headings,
+    B: chunks) that replace the parent; short docs / arXiv get a single card.
+    """
+    p = store.get_arxiv(aid)
+    if not p:
+        return 0
+
+    # Long-doc splitting only for top-level PDF entries (not already-split children).
+    full_text = None
+    if aid.startswith("pdf:") and "#" not in aid and p.get("url"):
+        full_text = pdf_source.download_and_extract_text(p["url"], max_pages=_CARD_PDF_MAX_PAGES)
+
+    if full_text and len(full_text) > _LONG_DOC_CHARS:
+        pieces = crossdomain.split_into_sections(full_text)
+        if len(pieces) >= 2:
+            parent_title = p.get("title", "")
+            made = 0
+            for j, piece in enumerate(pieces, 1):
+                title = f"{parent_title} — {piece['title']}"
+                card = crossdomain.generate_concept_card(
+                    {"title": title, "abstract": ""}, cfg, text=piece["text"])
+                if card:
+                    _insert_card_child(store, f"{aid}#{j:02d}", p, title, card)
+                    made += 1
+            if made:
+                store.delete_arxiv(aid)        # replace the parent with its sections
+                store.delete_embedding(aid)
+                return made
+            # split produced nothing usable → fall through to a single card
+
+    return 1 if _single_card(store, aid, p, cfg, text=full_text) else 0
+
+
+@app.post("/api/crossdomain/concept-cards", status_code=202)
+async def build_concept_cards(body: ConceptCardsRequest) -> dict:
+    """Generate concept cards (main math content) for corpus papers, in the
+    background. For PDF-sourced papers the body text is re-extracted for depth;
+    cards feed both display and (after re-embed) retrieval."""
+    if _corpus_card_jobs.get("cards", {}).get("status") == "running":
+        raise HTTPException(409, detail="Concept-card generation already running")
+
+    store = _corpus_store()
+    try:
+        papers, _ = store.get_all_arxiv(limit=10000, offset=0)
+    finally:
+        store.close()
+    # "needs a card" = no math_concepts yet (set only by card generation)
+    targets = [p["arxiv_id"] for p in papers if body.force or not p.get("math_concepts")]
+    if not targets:
+        _corpus_card_jobs["cards"] = {"status": "completed", "total": 0, "processed": 0, "generated": 0}
+        return {"status": "completed", "total": 0}
+
+    _corpus_card_jobs["cards"] = {"status": "running", "total": len(targets),
+                                  "processed": 0, "generated": 0}
+    cfg = _base_cfg
+
+    def _run():
+        job = _corpus_card_jobs["cards"]
+        store = _corpus_store()
+        try:
+            generated = 0
+            for i, aid in enumerate(targets):
+                try:
+                    generated += _card_one_paper(store, aid, cfg)
+                except Exception as e:
+                    log.warning("Concept card for %s failed: %s", aid, e)
+                job.update({"processed": i + 1, "generated": generated})
+            try:
+                rag.ensure_embeddings(store)  # re-embed refreshed/new papers
+            except Exception as e:
+                log.warning("concept-cards re-embed failed: %s", e)
+            job["status"] = "completed"
+        except Exception as e:
+            log.exception("concept-card generation failed: %s", e)
+            job["status"] = "failed"
+        finally:
+            store.close()
+
+    _brainstorm_executor.submit(_run)
+    return {"status": "started", "total": len(targets)}
+
+
+@app.get("/api/crossdomain/concept-cards")
+async def get_concept_cards_status() -> dict:
+    return {"job": _corpus_card_jobs.get("cards", {"status": "idle"})}
+
+
+# ---------------------------------------------------------------------------
+# Manual add-paper endpoints (must be BEFORE {arxiv_id:path} to avoid capture)
+# ---------------------------------------------------------------------------
+
+class PaperLookupRequest(BaseModel):
+    query: str
+
+
+class PaperCreateRequest(BaseModel):
+    arxiv_id: str = ""          # raw arXiv id or URL; blank for a non-arXiv paper
+    title: str
+    authors: str = ""
+    abstract: str = ""
+    url: str = ""
+    published: str = ""         # YYYY-MM-DD
+    venue: str = ""
+    summarize: bool = False
+
+    @field_validator("title")
+    @classmethod
+    def _title_required(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError("title is required")
+        return v.strip()
+
+
+@app.post("/api/topics/{topic_id}/papers/lookup")
+async def lookup_paper(topic_id: str, body: PaperLookupRequest) -> dict:
+    """Fetch arXiv metadata for preview without saving. Returns {found, paper}."""
+    reg = _get_registry()
+    if not reg.get_topic(topic_id):
+        raise HTTPException(404, detail="Topic not found")
+    query = body.query.strip()
+    if not query:
+        raise HTTPException(400, detail="query is required")
+    try:
+        paper = arxiv.fetch_by_id(query)
+    except httpx.HTTPError as e:
+        log.warning("arXiv lookup failed for %r: %s", query, e)
+        raise HTTPException(
+            502, detail="arXiv lookup failed; try again or enter details manually."
+        )
+    return {"found": paper is not None, "paper": paper}
+
+
+def _submit_summarize_job(topic: dict, topic_id: str, arxiv_id: str) -> None:
+    """Background-summarize a freshly added paper and write the fields back."""
+    topic_cfg = cfg_module.from_topic(topic, _base_cfg)
+
+    def _run():
+        store = Storage(_data_dir, topic_id)
+        try:
+            paper = store.get_arxiv(arxiv_id)
+            if not paper:
+                return
+            papers = [paper]
+            summarize_papers(papers, topic_cfg)
+            p = papers[0]
+            store.update_arxiv_summary(arxiv_id, {
+                "summary": p.get("summary", ""),
+                "key_insight": p.get("key_insight", ""),
+                "method": p.get("method", ""),
+                "contribution": p.get("contribution", ""),
+                "math_concepts": p.get("math_concepts", []),
+                # keep the user's venue if the summarizer didn't infer one
+                "venue": p.get("venue") or paper.get("venue", ""),
+                "cited_works": p.get("cited_works", []),
+            })
+            log.info("Summarized manually-added paper %s (topic %s)", arxiv_id, topic_id)
+        except Exception as e:
+            log.exception("Summarize job for manual paper %s failed: %s", arxiv_id, e)
+        finally:
+            store.close()
+
+    _brainstorm_executor.submit(_run)
+
+
+@app.post("/api/topics/{topic_id}/papers", status_code=201)
+async def add_paper(topic_id: str, body: PaperCreateRequest) -> dict:
+    """Manually add a paper. arxiv_id (id or URL) is optional; blank = free-form.
+
+    Dedups against existing papers (409 if present). When ``summarize`` is set,
+    an LLM summarize job runs in the background and fills the structured fields.
+    """
+    reg = _get_registry()
+    topic = reg.get_topic(topic_id)
+    if not topic:
+        raise HTTPException(404, detail="Topic not found")
+
+    raw_id = body.arxiv_id.strip()
+    arxiv_id = arxiv.extract_arxiv_id(raw_id) if raw_id else ""
+    if raw_id and not arxiv_id:
+        raise HTTPException(400, detail="Could not parse an arXiv ID from the provided value.")
+
+    if arxiv_id:
+        key = arxiv_id
+        doi = f"10.48550/arxiv.{arxiv_id}"
+        url = body.url.strip() or f"https://arxiv.org/abs/{arxiv_id}"
+    else:
+        # deterministic key so re-submitting the same paper dedups cleanly
+        digest = hashlib.sha1(
+            f"{body.title.strip()}|{body.url.strip()}".encode()
+        ).hexdigest()[:10]
+        key = f"manual:{digest}"
+        doi = ""
+        url = body.url.strip()
+
+    store = Storage(_data_dir, topic_id)
+    try:
+        if store.is_paper_seen(key, doi):
+            raise HTTPException(409, detail="This paper is already in the library.")
+        paper = {
+            "arxiv_id": key,
+            "paper_id": key,
+            "source": "manual",
+            "title": body.title.strip(),
+            "authors": body.authors.strip(),
+            "abstract": body.abstract.strip(),
+            "url": url,
+            "published": body.published.strip(),
+            "summary": "",
+            "key_insight": "",
+            "method": "",
+            "contribution": "",
+            "math_concepts": [],
+            "venue": body.venue.strip(),
+            "cited_works": [],
+            "quality_score": 0,
+            "citation_count": 0,
+            "doi": doi,
+        }
+        store.insert_arxiv(paper)
+        stored = store.get_arxiv(key)
+    finally:
+        store.close()
+
+    if body.summarize:
+        _submit_summarize_job(topic, topic_id, key)
+
+    return {"paper": stored, "summarizing": bool(body.summarize)}
+
+
+# ---------------------------------------------------------------------------
+# Batch add papers (comma/whitespace-separated arXiv IDs or URLs)
+# ---------------------------------------------------------------------------
+
+class BatchAddRequest(BaseModel):
+    text: str = ""
+    summarize: bool = False
+
+
+def _submit_batch_summarize_job(topic: dict, topic_id: str, arxiv_ids: list[str]) -> None:
+    """Background-summarize a set of freshly batch-added papers (one job)."""
+    topic_cfg = cfg_module.from_topic(topic, _base_cfg)
+    ids = list(arxiv_ids)
+
+    def _run():
+        store = Storage(_data_dir, topic_id)
+        try:
+            papers = [p for p in (store.get_arxiv(a) for a in ids) if p]
+            if not papers:
+                return
+            summarize_papers(papers, topic_cfg)  # batches internally
+            for p in papers:
+                store.update_arxiv_summary(p["arxiv_id"], {
+                    "summary": p.get("summary", ""),
+                    "key_insight": p.get("key_insight", ""),
+                    "method": p.get("method", ""),
+                    "contribution": p.get("contribution", ""),
+                    "math_concepts": p.get("math_concepts", []),
+                    "venue": p.get("venue", ""),
+                    "cited_works": p.get("cited_works", []),
+                })
+            log.info("Summarized %d batch-added papers (topic %s)", len(papers), topic_id)
+        except Exception as e:
+            log.exception("Batch summarize job failed: %s", e)
+        finally:
+            store.close()
+
+    _brainstorm_executor.submit(_run)
+
+
+@app.post("/api/topics/{topic_id}/papers/batch", status_code=201)
+async def add_papers_batch(topic_id: str, body: BatchAddRequest) -> dict:
+    """Add many arXiv papers at once from comma/whitespace-separated IDs or URLs.
+
+    Each entry is reported individually (added | duplicate | not_found | invalid
+    | error). Only arXiv IDs/URLs are supported — we can't auto-fetch metadata
+    for arbitrary links. Optional ``summarize`` runs one background job over all
+    adds. arXiv is queried once (``id_list``) for the whole batch.
+    """
+    reg = _get_registry()
+    topic = reg.get_topic(topic_id)
+    if not topic:
+        raise HTTPException(404, detail="Topic not found")
+
+    tokens = [t for t in re.split(r"[\s,]+", body.text.strip()) if t]
+    if not tokens:
+        raise HTTPException(400, detail="No URLs or arXiv IDs provided")
+
+    # dedup tokens, preserve order
+    seen_tok: set[str] = set()
+    uniq = [t for t in tokens if not (t in seen_tok or seen_tok.add(t))]
+
+    results: list[dict] = []
+    added_ids: list[str] = []
+    store = Storage(_data_dir, topic_id)
+    try:
+        pending: list[tuple[str, str]] = []  # (token, cleaned_id)
+        for tok in uniq:
+            cid = arxiv.extract_arxiv_id(tok)
+            if not cid:
+                results.append({"query": tok, "status": "invalid"})
+                continue
+            if store.is_paper_seen(cid, f"10.48550/arxiv.{cid}"):
+                results.append({"query": tok, "status": "duplicate", "arxiv_id": cid})
+                continue
+            pending.append((tok, cid))
+
+        fetched: dict[str, dict] = {}
+        fetch_failed = False
+        if pending:
+            try:
+                fetched = arxiv.fetch_many_by_id([cid for _, cid in pending])
+            except httpx.HTTPError as e:
+                log.warning("Batch arXiv fetch failed: %s", e)
+                fetch_failed = True
+
+        for tok, cid in pending:
+            if fetch_failed:
+                results.append({"query": tok, "status": "error", "arxiv_id": cid})
+                continue
+            meta = fetched.get(cid)
+            if not meta:
+                results.append({"query": tok, "status": "not_found", "arxiv_id": cid})
+                continue
+            if cid in added_ids:  # same id appeared twice via different URLs
+                results.append({"query": tok, "status": "duplicate", "arxiv_id": cid})
+                continue
+            store.insert_arxiv({
+                "arxiv_id": cid,
+                "paper_id": cid,
+                "source": "manual",
+                "title": meta.get("title", ""),
+                "authors": meta.get("authors", ""),
+                "abstract": meta.get("abstract", ""),
+                "url": meta.get("url", f"https://arxiv.org/abs/{cid}"),
+                "published": (meta.get("published", "") or "")[:10],
+                "summary": "",
+                "key_insight": "",
+                "method": "",
+                "contribution": "",
+                "math_concepts": [],
+                "venue": "",
+                "cited_works": [],
+                "quality_score": 0,
+                "citation_count": 0,
+                "doi": meta.get("doi", f"10.48550/arxiv.{cid}"),
+            })
+            added_ids.append(cid)
+            results.append({"query": tok, "status": "added", "arxiv_id": cid,
+                            "title": meta.get("title", "")})
+    finally:
+        store.close()
+
+    if body.summarize and added_ids:
+        _submit_batch_summarize_job(topic, topic_id, added_ids)
+
+    counts = {k: sum(1 for r in results if r["status"] == k)
+              for k in ("added", "duplicate", "not_found", "invalid", "error")}
+    return {"results": results, "counts": counts,
+            "summarizing": bool(body.summarize and added_ids)}
 
 
 # ---------------------------------------------------------------------------
@@ -1696,7 +2655,7 @@ Rules:
 Text to translate:
 {body.content}"""
 
-    translated = call_cli(prompt, _base_cfg, model="sonnet", timeout=120)
+    translated = call_cli(prompt, _base_cfg, model="sonnet", timeout=300)
     if not translated:
         raise HTTPException(500, detail="Translation failed")
 

@@ -34,10 +34,13 @@ export default function TopicOverviewPage() {
 
   if (!topic) return null;
 
-  const totalPapers =
-    sessionsData?.sessions.reduce((sum, s) => sum + s.paper_count, 0) ?? 0;
-  const totalRepos =
-    sessionsData?.sessions.reduce((sum, s) => sum + s.repo_count, 0) ?? 0;
+  // Manual insight sessions live alongside runs in the registry; keep the
+  // Overview's run history + totals about pipeline runs only.
+  const runSessions =
+    sessionsData?.sessions.filter((s) => s.kind !== "manual") ?? [];
+
+  const totalPapers = runSessions.reduce((sum, s) => sum + s.paper_count, 0);
+  const totalRepos = runSessions.reduce((sum, s) => sum + s.repo_count, 0);
 
   return (
     <div className="space-y-6">
@@ -97,12 +100,12 @@ export default function TopicOverviewPage() {
             Sessions
           </h2>
           <span className="text-xs text-slate-400 font-medium tabular-nums">
-            {sessionsData?.sessions.length ?? 0} total
+            {runSessions.length} total
           </span>
         </div>
         <div className="p-5">
           <SessionList
-            sessions={sessionsData?.sessions ?? []}
+            sessions={runSessions}
             onSelect={setSelectedSession}
             selectedId={selectedSession?.id}
           />

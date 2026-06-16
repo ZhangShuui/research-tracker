@@ -156,6 +156,9 @@ class Scheduler:
                 "repo_count": result["repo_count"],
                 "report_path": result["report_path"],
                 "insights_path": result["insights_path"],
+                # Carry any source-failure summary so a degraded ("partial")
+                # run shows *why* it came back thin instead of silently green.
+                "error_message": result.get("error_message", ""),
             })
             self.progress.pop(topic_id, None)
         except Exception as e:

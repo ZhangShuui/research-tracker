@@ -13,6 +13,7 @@ import pytest
 from paper_tracker.summarizer import (
     filter_papers_by_quality,
     refilter_papers,
+    prefilter_by_relevance,
     _parse_json_array,
 )
 
@@ -156,8 +157,10 @@ class TestFilterPapersByQuality:
         assert mock_cli.call_args[1].get("model") == "opus"
 
     @patch("paper_tracker.llm.call_cli")
-    def test_batching_10_per_batch(self, mock_cli):
-        """Should process 10 papers per batch."""
+    def test_batches_by_configured_size(self, mock_cli):
+        """Should batch papers by _QUALITY_FILTER_BATCH_SIZE."""
+        import math
+        from paper_tracker.summarizer import _QUALITY_FILTER_BATCH_SIZE
         papers = [_paper(f"{i:03d}") for i in range(25)]
 
         def _fake_response(prompt, cfg, **kw):
@@ -171,7 +174,7 @@ class TestFilterPapersByQuality:
         mock_cli.side_effect = _fake_response
 
         result = filter_papers_by_quality(papers, _CFG, "test topic")
-        assert mock_cli.call_count == 3  # 10 + 10 + 5
+        assert mock_cli.call_count == math.ceil(len(papers) / _QUALITY_FILTER_BATCH_SIZE)
         assert len(result) == 25
 
 
@@ -269,3 +272,110 @@ class TestRefilterPapers:
         scores = {p["arxiv_id"]: p["quality_score"] for p in result}
         assert scores["001"] == 5
         assert scores["002"] == 2  # unchanged
+
+
+# ---------------------------------------------------------------
+# prefilter_by_relevance
+# ---------------------------------------------------------------
+
+class TestPrefilterByRelevance:
+    @patch("paper_tracker.llm.call_cli")
+    def test_drops_irrelevant_papers(self, mock_cli):
+        """Papers marked relevant=false should be dropped."""
+        papers = [_paper("001"), _paper("002"), _paper("003")]
+
+        mock_cli.return_value = json.dumps([
+            {"id": "001", "relevant": True, "reason": "on topic"},
+            {"id": "002", "relevant": False, "reason": "GAN paper"},
+            {"id": "003", "relevant": True, "reason": "on topic"},
+        ])
+
+        result = prefilter_by_relevance(papers, _CFG, "LLM collapse")
+        ids = {p["arxiv_id"] for p in result}
+        assert ids == {"001", "003"}
+
+    @patch("paper_tracker.llm.call_cli")
+    def test_empty_input(self, mock_cli):
+        assert prefilter_by_relevance([], _CFG, "topic") == []
+        mock_cli.assert_not_called()
+
+    @patch("paper_tracker.llm.call_cli")
+    def test_unscored_kept_benefit_of_doubt(self, mock_cli):
+        """Papers not mentioned in LLM response should be kept."""
+        papers = [_paper("001"), _paper("002")]
+        mock_cli.return_value = json.dumps([
+            {"id": "001", "relevant": False, "reason": "off-topic"},
+        ])
+        result = prefilter_by_relevance(papers, _CFG, "topic")
+        ids = {p["arxiv_id"] for p in result}
+        assert ids == {"002"}  # 001 dropped, 002 unscored so kept
+
+    @patch("paper_tracker.llm.call_cli")
+    def test_cli_failure_keeps_all(self, mock_cli):
+        """If CLI returns None, all papers in that batch are kept."""
+        papers = [_paper("001"), _paper("002")]
+        mock_cli.return_value = None
+        result = prefilter_by_relevance(papers, _CFG, "topic")
+        assert len(result) == 2
+
+    @patch("paper_tracker.llm.call_cli")
+    def test_uses_sonnet_model(self, mock_cli):
+        """Prefilter is a subagent-tier task — must use sonnet, not opus."""
+        papers = [_paper("001")]
+        mock_cli.return_value = json.dumps([{"id": "001", "relevant": True, "reason": "ok"}])
+        prefilter_by_relevance(papers, _CFG, "topic")
+        assert mock_cli.call_args[1].get("model") == "sonnet"
+
+    @patch("paper_tracker.llm.call_cli")
+    def test_batches_by_configured_size(self, mock_cli):
+        """Should batch papers by _PREFILTER_BATCH_SIZE."""
+        import math
+        from paper_tracker.summarizer import _PREFILTER_BATCH_SIZE
+        papers = [_paper(f"{i:03d}") for i in range(60)]
+
+        def _fake(prompt, cfg, **kw):
+            return json.dumps([
+                {"id": p["arxiv_id"], "relevant": True, "reason": "ok"}
+                for p in papers if p["arxiv_id"] in prompt
+            ])
+
+        mock_cli.side_effect = _fake
+        result = prefilter_by_relevance(papers, _CFG, "topic")
+        assert mock_cli.call_count == math.ceil(len(papers) / _PREFILTER_BATCH_SIZE)
+        assert len(result) == 60
+
+    @patch("paper_tracker.llm.call_cli")
+    def test_criteria_appears_in_prompt(self, mock_cli):
+        """Custom prefilter_criteria must be present in the prompt."""
+        papers = [_paper("001")]
+        mock_cli.return_value = json.dumps([{"id": "001", "relevant": True, "reason": "ok"}])
+        prefilter_by_relevance(
+            papers, _CFG, "LLM Multi-turn Collapse",
+            criteria="Exclude GAN papers even if they mention mode collapse.",
+        )
+        prompt = mock_cli.call_args[0][0]
+        assert "Exclude GAN papers" in prompt
+
+    @patch("paper_tracker.llm.call_cli")
+    def test_description_and_keywords_in_prompt(self, mock_cli):
+        papers = [_paper("001")]
+        mock_cli.return_value = json.dumps([{"id": "001", "relevant": True, "reason": "ok"}])
+        prefilter_by_relevance(
+            papers, _CFG, "LLM Collapse",
+            description="Study of diversity loss in LLM dialogue.",
+            keywords=["mode collapse", "persona drift"],
+        )
+        prompt = mock_cli.call_args[0][0]
+        assert "diversity loss in LLM dialogue" in prompt
+        assert "mode collapse" in prompt
+        assert "persona drift" in prompt
+
+    @patch("paper_tracker.llm.call_cli")
+    def test_title_and_abstract_in_prompt_but_not_method(self, mock_cli):
+        """Prefilter sees title+abstract only (summarizer hasn't run yet)."""
+        papers = [_paper("001", title="A study of X", abstract="We investigate Y.")]
+        mock_cli.return_value = json.dumps([{"id": "001", "relevant": True, "reason": "ok"}])
+        prefilter_by_relevance(papers, _CFG, "topic")
+        prompt = mock_cli.call_args[0][0]
+        assert "A study of X" in prompt
+        assert "We investigate Y." in prompt

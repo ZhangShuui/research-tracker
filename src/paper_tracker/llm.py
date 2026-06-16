@@ -224,6 +224,10 @@ def _strip_copilot_stats(text: str) -> str:
     return text
 
 
+_COPILOT_MAX_TIMEOUT = 90  # hard ceiling: copilot CLI is non-streaming, so a slow/
+                           # stalled call would block the whole timeout — fail fast instead.
+
+
 def call_copilot(
     prompt: str,
     cfg: dict,
@@ -237,14 +241,16 @@ def call_copilot(
     Args:
         prompt: The full prompt text.
         cfg: Pipeline config dict (needs cfg["summarizer"] for CLI paths).
-        timeout: Idle timeout in seconds.
+        timeout: Idle timeout in seconds (hard-capped at 90s — see _COPILOT_MAX_TIMEOUT).
 
     Returns:
         Raw stdout string, or None on failure.
     """
     scfg = cfg.get("summarizer", {})
     copilot_path = scfg.get("copilot_path", "copilot")
-    copilot_timeout = timeout or max(scfg.get("copilot_timeout", 300), 120)
+    # Cap at 90s regardless of caller/config (a passed-in larger timeout is clamped).
+    copilot_timeout = min(timeout or scfg.get("copilot_timeout", _COPILOT_MAX_TIMEOUT),
+                          _COPILOT_MAX_TIMEOUT)
     copilot_model = scfg.get("copilot_model", "")
 
     cmd = [copilot_path, "-p", prompt, "-s"]

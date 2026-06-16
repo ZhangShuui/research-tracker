@@ -244,7 +244,7 @@ def generate_chat_response(
 
     prompt = f"{system}\n\n## User Message\n\n{user_message}"
 
-    raw = call_cli(prompt, cfg, model="opus", timeout=120)
+    raw = call_cli(prompt, cfg, model="opus", timeout=300)
     if not raw:
         return {"content": "I'm sorry, I wasn't able to generate a response. Please try again.", "cited_papers": []}
 

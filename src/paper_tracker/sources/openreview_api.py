@@ -40,8 +40,6 @@ def search(cfg: dict) -> list[dict]:
     venue_keys = search_cfg.get("openreview_venues", [])
     keywords = search_cfg.get("openreview_keywords") or search_cfg.get("arxiv_keywords", [])
     max_results = search_cfg.get("openreview_max_results", 100)
-    date_from = search_cfg.get("search_date_from", "")
-    date_to = search_cfg.get("search_date_to", "")
 
     if not venue_keys:
         log.warning("OpenReview: no venues configured, skipping")
@@ -55,15 +53,12 @@ def search(cfg: dict) -> list[dict]:
         log.info("OpenReview: searching venue=%s (%s), keywords=%s",
                  venue_key, venue_id, keywords)
 
+        # Venue selection already scopes recency (e.g. the *2025 venues), so we
+        # do NOT apply search_date_from here: conference papers are submitted
+        # months before the event, so a date floor would wrongly drop them all.
         papers = _search_venue(venue_id, keywords, max_results)
         for p in papers:
             if p["paper_id"] in seen_ids:
-                continue
-            # Date range post-filter
-            pub = p.get("published", "")
-            if date_from and pub and pub < date_from:
-                continue
-            if date_to and pub and pub > date_to + "T23:59:59":
                 continue
             seen_ids.add(p["paper_id"])
             all_papers.append(p)
@@ -74,21 +69,8 @@ def search(cfg: dict) -> list[dict]:
     return all_papers
 
 
-def _venue_matches(note_venue: str, venue_id: str) -> bool:
-    """Check if a note's venue field matches the target venue.
-
-    e.g. 'ICLR 2025 Poster' matches 'ICLR.cc/2025/Conference'
-    """
-    nv = note_venue.lower()
-    parts = venue_id.split("/")
-    # Extract key parts: venue name and year
-    name = parts[0].split(".")[0].lower() if "." in parts[0] else parts[0].lower()
-    year = ""
-    for p in parts:
-        if p.isdigit() and len(p) == 4:
-            year = p
-            break
-    return name in nv and (not year or year in nv)
+_OR_NOTES = "https://api2.openreview.net/notes"
+_VENUE_SCAN_CAP = 1000  # max notes to scan per venue while keyword-filtering
 
 
 def _search_venue(
@@ -96,70 +78,53 @@ def _search_venue(
     keywords: list[str],
     max_results: int,
 ) -> list[dict]:
-    """Search a single OpenReview venue with optional keywords."""
-    query = " ".join(keywords) if keywords else ""
+    """List a venue's papers (by ``content.venueid``) and keyword-filter locally.
 
-    if query:
-        # Use search endpoint with keyword filtering + venue post-filter
-        search_url = _OR_API
-        # Fetch more to account for venue filtering
-        fetch_limit = min(max_results * 3, 300)
-        params: dict = {
-            "query": query,
-            "limit": min(fetch_limit, 100),
-            "offset": 0,
-            "source": "forum",
-        }
-    else:
-        # No keywords: use invitation-based listing
-        search_url = "https://api2.openreview.net/notes"
-        fetch_limit = max_results
-        params = {
-            "invitation": f"{venue_id}/-/Submission",
-            "limit": min(fetch_limit, 100),
-            "offset": 0,
-        }
-
-    all_papers: list[dict] = []
+    OpenReview's keyword /search endpoint ranks across ALL venues, so it almost
+    never surfaces a *specific* venue's papers. Listing the venue directly and
+    matching keywords against title+abstract reliably scopes results to the venue.
+    Scans up to ``_VENUE_SCAN_CAP`` notes (venues can hold thousands).
+    """
+    kw_lower = [k.lower() for k in keywords]
+    matched: list[dict] = []
+    scanned = 0
     offset = 0
+    page = 100
 
-    while offset < fetch_limit and len(all_papers) < max_results:
-        params["offset"] = offset
-
+    while scanned < _VENUE_SCAN_CAP and len(matched) < max_results:
+        params = {"content.venueid": venue_id, "limit": page, "offset": offset}
         try:
-            resp = httpx_get_with_retry(search_url, params=params, timeout=30)
+            resp = httpx_get_with_retry(_OR_NOTES, params=params, timeout=30)
         except httpx.HTTPError as e:
-            log.error("OpenReview API failed (offset=%d): %s", offset, e)
+            log.error("OpenReview venue listing failed (venue=%s offset=%d): %s",
+                      venue_id, offset, e)
             break
 
-        data = resp.json()
-        notes = data.get("notes", [])
+        notes = resp.json().get("notes", [])
         if not notes:
             break
+        scanned += len(notes)
 
         for note in notes:
-            # Venue post-filter when using search endpoint
-            if query:
-                content = note.get("content", {})
-                note_venue = content.get("venue")
-                if isinstance(note_venue, dict):
-                    note_venue = note_venue.get("value", "")
-                if not note_venue or not _venue_matches(note_venue, venue_id):
-                    continue
-
             paper = _parse_note(note, venue_id)
-            if paper is not None:
-                all_papers.append(paper)
-                if len(all_papers) >= max_results:
-                    break
+            if paper is None:
+                continue
+            if kw_lower:
+                hay = f"{paper['title']} {paper['abstract']}".lower()
+                if not any(k in hay for k in kw_lower):
+                    continue
+            matched.append(paper)
+            if len(matched) >= max_results:
+                break
 
-        if len(notes) < params.get("limit", 100):
+        if len(notes) < page:
             break
-
         offset += len(notes)
         time.sleep(_RATE_LIMIT_SECS)
 
-    return all_papers
+    log.info("OpenReview venue=%s: %d keyword matches (scanned %d notes)",
+             venue_id, len(matched), scanned)
+    return matched
 
 
 def _parse_note(note: dict, venue_id: str) -> dict | None:

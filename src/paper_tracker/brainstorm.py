@@ -566,6 +566,70 @@ Reply ONLY with a JSON array (no markdown):
 }}]"""
 
 
+# Theory-focused idea-stage review (supersedes the split feasibility/novelty
+# reviewers). Judges the IDEA's contribution + soundness, NOT experimental
+# completeness; can investigate prior work when run through the agentic judge.
+_RIGOR_REVIEW_PROMPT = """\
+You are a rigorous THEORY-FOCUSED reviewer evaluating brainstorm ideas at the \
+IDEA stage — before any research plan or experiments exist.
+
+## Research Topic
+"{topic_name}"
+
+## Paper Library ({n_papers} papers)
+{paper_summaries}
+
+## Ideas to Review
+{ideas_text}
+
+## What to judge (and what NOT to)
+Judge the IDEA itself — its theoretical contribution and soundness. Do NOT \
+penalize an idea for missing experimental detail, unspecified datasets / baselines \
+/ metrics, compute cost, or implementation effort — those belong to the \
+research-plan stage, not now. Only raise feasibility if the idea is FUNDAMENTALLY \
+impossible or self-contradictory.
+
+For EACH idea, score 3 dimensions (1-10):
+
+- **novelty** — theoretical / conceptual newness. Apply the "X + Y" test: if the \
+contribution is just "apply X to Y" with no non-obvious insight, novelty <= 5. \
+Differentiate from the CLOSEST prior work. \
+(1 = known combination, 5 = incremental twist, 10 = genuinely new principle)
+
+- **rigor** — theoretical soundness / 严谨性. Are the core assumptions valid and \
+stated? Is the reasoning internally consistent? Is the central claim precise or \
+hand-wavy? Any unjustified logical leaps, hidden circularity, or claims that don't \
+follow? Would the argument survive a sharp theorist's scrutiny? \
+(1 = hand-waving / unsound, 5 = plausible but gaps, 10 = tight, well-grounded)
+
+- **significance** — theoretical / scientific importance IF correct. Would it \
+change how the field thinks, unify disparate results, or open new directions? \
+(1 = marginal, 5 = useful to specialists, 10 = foundational)
+
+Also INVESTIGATE the closest PRIOR WORK for each idea (use your search tools if \
+available; otherwise reason from the library) and CHALLENGE the idea against it — \
+does prior work already do this? does it break an assumption the idea relies on?
+
+Verdict:
+- ACCEPT: strong (overall >= 7, no dimension < 5)
+- REVISE: potential, fixable theoretical weaknesses (overall 5-7)
+- DROP: unsound, unoriginal, or fundamentally impossible
+
+Reply ONLY with a JSON array (no markdown):
+[{{
+  "idea_title": "...",
+  "novelty": 7, "rigor": 6, "significance": 7,
+  "prior_work": "closest prior work found + how the idea differs or fails to",
+  "novelty_diagnosis": "genuine insight vs X+Y; name X and Y if applicable",
+  "rigor_diagnosis": "the main soundness concern, or why it holds",
+  "feasibility_redflag": false,
+  "weaknesses": ["..."],
+  "strengths": ["..."],
+  "verdict": "REVISE",
+  "revision_instructions": ["sharpen assumption Z", "differentiate from prior work W"]
+}}]"""
+
+
 # ---------------------------------------------------------------------------
 # Stage 1.5: Novelty Challenge Prompts
 # ---------------------------------------------------------------------------
@@ -1169,30 +1233,38 @@ def _load_discovery_context(registry) -> str:
 # Enhanced Context Loaders (Phase 1)
 # ---------------------------------------------------------------------------
 
-def _load_topic_insights(data_dir: str, topic_id: str, registry) -> str:
-    """Load the latest insights.md for this topic. Returns formatted string."""
+def _load_topic_insights(
+    data_dir: str, topic_id: str, registry, session_id: str | None = None
+) -> str:
+    """Load a topic's insights.md and format it for the prompt.
+
+    Uses the session ``session_id`` when given (lets the user pick which insights
+    memo to brainstorm from), otherwise the latest session.
+    """
     if registry is None:
         return ""
     try:
-        latest = registry.get_latest_session(topic_id)
-        if not latest:
+        sess = (registry.get_session(topic_id, session_id) if session_id
+                else registry.get_latest_session(topic_id))
+        if not sess:
             return ""
-        insights_path = latest.get("insights_path", "")
+        insights_path = sess.get("insights_path", "")
         if not insights_path:
             return ""
         from pathlib import Path
         p = Path(insights_path)
         if not p.exists():
             # Try relative to data_dir
-            p = Path(data_dir) / topic_id / "sessions" / latest["id"] / "insights.md"
+            p = Path(data_dir) / topic_id / "sessions" / sess["id"] / "insights.md"
         if not p.exists():
             return ""
         content = p.read_text(encoding="utf-8")
         if not content.strip():
             return ""
+        which = "selected session" if session_id else "latest paper analysis"
         # Truncate to keep prompt manageable
         return (
-            "## Topic Insights (from latest paper analysis)\n"
+            f"## Topic Insights (from {which})\n"
             "These insights were synthesized from your paper library. Pay special "
             "attention to Research Gaps & Opportunities — these are prime idea seeds.\n\n"
             + content[:4000]
@@ -1200,6 +1272,33 @@ def _load_topic_insights(data_dir: str, topic_id: str, registry) -> str:
     except Exception as e:
         log.debug("Failed to load topic insights: %s", e)
         return ""
+
+
+def _load_insights_manifest(
+    data_dir: str, topic_id: str, registry, session_id: str | None = None
+) -> list[dict]:
+    """Load the insights paper-provenance manifest ([Pn] -> paper) for a session.
+
+    Mirrors _load_topic_insights' session choice so the [Pn] indices line up with
+    the memo brainstorm is using. Returns [] if absent.
+    """
+    if registry is None:
+        return []
+    try:
+        import json
+        from pathlib import Path
+        sess = (registry.get_session(topic_id, session_id) if session_id
+                else registry.get_latest_session(topic_id))
+        if not sess:
+            return []
+        mpath = Path(data_dir) / topic_id / "sessions" / sess["id"] / "insights_papers.json"
+        if not mpath.exists():
+            return []
+        data = json.loads(mpath.read_text(encoding="utf-8"))
+        return data if isinstance(data, list) else []
+    except Exception as e:
+        log.debug("Failed to load insights manifest: %s", e)
+        return []
 
 
 def _load_session_reports(data_dir: str, topic_id: str, registry) -> str:
@@ -1469,7 +1568,7 @@ def _generate_research_questions(
 
     def _run_claude():
         nonlocal claude_result
-        raw = call_cli(prompt, cfg, model="opus", timeout=120)
+        raw = call_cli(prompt, cfg, model="opus", timeout=300)
         if raw:
             parsed = _parse_json_with_repair(raw, cfg, label="questions_claude")
             if isinstance(parsed, list):
@@ -1477,7 +1576,7 @@ def _generate_research_questions(
 
     def _run_codex():
         nonlocal codex_result
-        raw = call_codex(prompt, cfg, timeout=120)
+        raw = call_codex(prompt, cfg, timeout=300)
         if raw:
             parsed = _parse_json_with_repair(raw, cfg, label="questions_codex")
             if isinstance(parsed, list):
@@ -1644,7 +1743,7 @@ def _build_novelty_map(
 
     def _run_claude():
         nonlocal claude_result
-        raw = call_cli(prompt, cfg, model="opus", timeout=120)
+        raw = call_cli(prompt, cfg, model="opus", timeout=300)
         if raw:
             parsed = _parse_json_with_repair(raw, cfg, label="novelty_map_claude")
             if isinstance(parsed, list):
@@ -1652,7 +1751,7 @@ def _build_novelty_map(
 
     def _run_codex():
         nonlocal codex_result
-        raw = call_codex(prompt, cfg, timeout=120)
+        raw = call_codex(prompt, cfg, timeout=300)
         if raw:
             parsed = _parse_json_with_repair(raw, cfg, label="novelty_map_codex")
             if isinstance(parsed, list):
@@ -1712,35 +1811,28 @@ def _identify_bottleneck(review: dict) -> tuple[str, str]:
     Returns (bottleneck_name, instruction_text).
     """
     n = review.get("novelty", 5)
-    i = review.get("impact", 5)
-    f = review.get("feasibility", 5)
-    c = review.get("clarity", 5)
+    rig = review.get("rigor", 5)
+    sig = review.get("significance", 5)
 
-    dims = {"novelty": n, "impact": i, "feasibility": f, "clarity": c}
+    dims = {"novelty": n, "rigor": rig, "significance": sig}
     bottleneck = min(dims, key=dims.get)
     score = dims[bottleneck]
 
-    if bottleneck == "feasibility":
-        hint = (f"BOTTLENECK: feasibility ({score}/10). "
-                "Make the method more concrete: specify architectures, datasets, "
-                "compute budget, and implementation steps. "
-                "Do NOT simplify the core idea or reduce novelty.")
-    elif bottleneck == "novelty":
-        boost = review.get("novelty_boost_hint", "")
-        diag = review.get("novelty_diagnosis", "")
+    if bottleneck == "novelty":
+        boost = review.get("novelty_boost_hint", "") or ""
+        diag = review.get("novelty_diagnosis", "") or ""
         hint = (f"BOTTLENECK: novelty ({score}/10). "
-                f"Diagnosis: {diag[:200]} "
-                f"Hint: {boost[:200]} "
-                "Do NOT make feasibility worse — keep the method implementable.")
-    elif bottleneck == "impact":
-        hint = (f"BOTTLENECK: impact ({score}/10). "
-                "Strengthen the motivation: who benefits, what problem size, "
-                "what downstream applications. Do NOT change the method.")
-    else:  # clarity
-        hint = (f"BOTTLENECK: clarity ({score}/10). "
-                "Rewrite the method description more precisely. "
-                "Add concrete notation, pseudocode, or algorithmic steps. "
-                "Do NOT change what the method does.")
+                f"Diagnosis: {diag[:200]} Hint: {boost[:200]} "
+                "Break out of the X+Y pattern with a non-obvious insight; do NOT weaken the rigor.")
+    elif bottleneck == "rigor":
+        diag = review.get("rigor_diagnosis", "") or ""
+        hint = (f"BOTTLENECK: rigor ({score}/10). {diag[:240]} "
+                "State and justify the core assumptions, close the logical gaps, and make the "
+                "central claim precise. Do NOT reduce novelty.")
+    else:  # significance
+        hint = (f"BOTTLENECK: significance ({score}/10). "
+                "Articulate why this matters theoretically — what it unifies, generalizes, or "
+                "opens up. Do NOT change the core mechanism.")
 
     return bottleneck, hint
 
@@ -1763,22 +1855,23 @@ def _format_ideas_with_reviews(
         lines.append(f"Experiment: {idea.get('experiment_plan', '')}")
         if review:
             lines.append(f"\n**Review Scores**: novelty={review.get('novelty', '?')}, "
-                         f"feasibility={review.get('feasibility', '?')}, "
-                         f"clarity={review.get('clarity', '?')}, "
-                         f"impact={review.get('impact', '?')}, "
+                         f"rigor={review.get('rigor', '?')}, "
+                         f"significance={review.get('significance', '?')}, "
                          f"overall={review.get('overall', '?')}")
+            pw = review.get("prior_work")
+            if pw:
+                lines.append(f"**Closest prior work**: {pw}")
 
             if targeted and verdict == "REVISE":
                 bottleneck, instruction = _identify_bottleneck(review)
                 lines.append(f"\n**>>> TARGETED FIX: {instruction}**")
                 # Show which dimensions are GOOD and must be preserved
                 n = review.get("novelty", 5)
-                imp = review.get("impact", 5)
-                f = review.get("feasibility", 5)
-                c = review.get("clarity", 5)
+                rig = review.get("rigor", 5)
+                sig = review.get("significance", 5)
                 preserve = [
                     f"{dim}={s}" for dim, s in
-                    [("novelty", n), ("impact", imp), ("feasibility", f), ("clarity", c)]
+                    [("novelty", n), ("rigor", rig), ("significance", sig)]
                     if dim != bottleneck and s >= 6
                 ]
                 if preserve:
@@ -1801,6 +1894,9 @@ def _format_ideas_with_reviews(
                 hint = review.get("novelty_boost_hint")
                 if hint:
                     lines.append(f"**Novelty Boost Hint**: {hint}")
+                rdiag = review.get("rigor_diagnosis", "")
+                if rdiag:
+                    lines.append(f"**Rigor Diagnosis**: {rdiag}")
         lines.append("")
     return "\n".join(lines)
 
@@ -2032,19 +2128,100 @@ def _review_ideas_single(
     return parsed
 
 
+def _normalize_review(r: dict) -> dict:
+    """Normalize a raw theory-review dict: clamp dims, derive overall + verdict.
+
+    Dimensions: novelty / rigor / significance (accepts legacy ``impact`` as an
+    alias for significance). ``feasibility_redflag`` forces DROP.
+    """
+    nov = _clamp_score(r.get("novelty", 5))
+    rig = _clamp_score(r.get("rigor", 5))
+    sig = _clamp_score(r.get("significance", r.get("impact", 5)))
+    overall = round(nov * 0.40 + rig * 0.35 + sig * 0.25, 1)
+    redflag = bool(r.get("feasibility_redflag", False))
+    scores = [nov, rig, sig]
+    if redflag or overall < 5.0 or any(s <= 2 for s in scores):
+        verdict = "DROP"
+    elif overall >= 7.0 and all(s >= 5 for s in scores):
+        verdict = "ACCEPT"
+    elif nov >= 8:  # high theoretical novelty graduates even if other dims lag
+        verdict = "CONDITIONAL_ACCEPT"
+    else:
+        verdict = "REVISE"
+
+    instructions = [str(x) for x in (r.get("revision_instructions") or []) if str(x).strip()]
+    if verdict == "REVISE" and not instructions:
+        if nov < 6:
+            instructions.append(f"Novelty is weak ({nov}/10): find a non-obvious insight beyond an "
+                                "X+Y combination and differentiate from the closest prior work.")
+        if rig < 6:
+            instructions.append(f"Rigor is weak ({rig}/10): state and justify the core assumptions "
+                                "and close the logical gaps in the central claim.")
+        if sig < 6:
+            instructions.append(f"Significance is limited ({sig}/10): articulate what this would "
+                                "unify, generalize, or open up theoretically.")
+
+    return {
+        "idea_title": r.get("idea_title", ""),
+        "novelty": nov, "rigor": rig, "significance": sig,
+        "overall": overall, "verdict": verdict,
+        "prior_work": r.get("prior_work", ""),
+        "novelty_diagnosis": r.get("novelty_diagnosis", ""),
+        "rigor_diagnosis": r.get("rigor_diagnosis", ""),
+        "novelty_boost_hint": r.get("novelty_boost_hint"),
+        "feasibility_redflag": redflag,
+        "weaknesses": [str(x) for x in (r.get("weaknesses") or []) if str(x).strip()],
+        "strengths": [str(x) for x in (r.get("strengths") or []) if str(x).strip()],
+        "revision_instructions": instructions,
+    }
+
+
 def _review_ideas(
     ideas: list[dict],
     topic_name: str,
     paper_summaries: str,
     n_papers: int,
     cfg: dict,
+    *,
+    ctx_opts: dict | None = None,
+    data_dir: str | None = None,
+    topic_id: str | None = None,
 ) -> list[dict]:
-    """Review ideas via parallel split reviewers. Returns list of review dicts.
+    """Review ideas with a theory-focused judge (novelty / rigor / significance).
 
-    Uses 2 parallel reviewers (feasibility/clarity + novelty/impact) for better
-    calibration. Falls back to single-reviewer mode if both fail.
+    At the IDEA stage we judge the contribution itself, not experimental
+    completeness. When ``agentic_review`` is enabled (with data_dir + topic_id),
+    the judge investigates prior work via search tools before scoring; otherwise,
+    and on agent failure, a one-shot opus review is used.
     """
-    return _review_ideas_split(ideas, topic_name, paper_summaries, n_papers, cfg)
+    if not ideas:
+        return []
+    ideas_text = _format_ideas_for_prompt(ideas)
+    prompt = _RIGOR_REVIEW_PROMPT.format(
+        topic_name=topic_name, n_papers=n_papers,
+        paper_summaries=paper_summaries, ideas_text=ideas_text,
+    )
+
+    raw = ""
+    if ctx_opts and ctx_opts.get("agentic_review") and data_dir and topic_id:
+        from paper_tracker import brainstorm_agent
+        raw = brainstorm_agent.review_ideas(
+            prompt, data_dir=data_dir, topic_id=topic_id, cfg=cfg)
+        if raw:
+            log.info("Agentic review produced %d chars", len(raw))
+        else:
+            log.warning("Agentic review empty — falling back to one-shot")
+    if not raw:
+        raw = call_cli(prompt, cfg, model="opus", timeout=600)
+    if not raw:
+        log.warning("Idea review failed (no output)")
+        return []
+
+    parsed = _parse_json_with_repair(raw, cfg, label="idea_review")
+    if not isinstance(parsed, list):
+        log.warning("Idea review returned non-list JSON")
+        return []
+    return [_normalize_review(r) for r in parsed if isinstance(r, dict)]
 
 
 def _refine_ideas(
@@ -2371,7 +2548,7 @@ def _run_parallel_research(
 
     def _run_landscape(prompt: str) -> dict | None:
         """Thread 3: Copilot first, fallback to Claude opus."""
-        raw = call_copilot(prompt, cfg, timeout=600)
+        raw = call_copilot(prompt, cfg, timeout=90)
         if not raw:
             log.info("Copilot failed for landscape, falling back to Claude opus")
             raw = call_cli(prompt, cfg, model="opus", timeout=600)
@@ -2589,7 +2766,7 @@ def _run_novelty_challenge(
 
     def _run_analogy() -> list[dict]:
         """Thread 2: Copilot → Claude fallback for analogical leaps."""
-        raw = call_copilot(prompt_analogy, cfg, timeout=600)
+        raw = call_copilot(prompt_analogy, cfg, timeout=90)
         if not raw:
             log.info("Analogical Leaper: Copilot failed, falling back to Claude")
             raw = call_cli(prompt_analogy, cfg, model="opus", timeout=600)
@@ -2617,7 +2794,7 @@ def _run_novelty_challenge(
             idea_method=method, idea_experiment=experiment,
             wild_perspectives=wild_perspectives,
         )
-        raw = call_copilot(prompt, cfg, timeout=600)
+        raw = call_copilot(prompt, cfg, timeout=90)
         if not raw:
             log.info("Wild Perspective: Copilot failed, falling back to Claude")
             raw = call_cli(prompt, cfg, model="opus", timeout=600)
@@ -3135,7 +3312,78 @@ _DEFAULT_CONTEXT_OPTIONS: dict = {
     "use_citations": True,
     "use_questions": True,
     "use_novelty_map": True,
+    # Agentic, retrieval-augmented idea generation: let the model look up the
+    # originals of the cited insights papers and search local + arXiv for more.
+    # Conservative default for programmatic/unspecified callers (it spawns a live
+    # tool-use agent). The UI opts in explicitly (frontend defaults the toggle ON).
+    "agentic_retrieval": False,
+    # Agentic idea REVIEW: let the judge investigate prior work (search arXiv +
+    # local) during review. Heavier (review runs up to 4x/run) → opt-in, default
+    # OFF even in the UI. The theory-focused review criteria apply regardless.
+    "agentic_review": False,
 }
+
+
+def _load_novelty_method() -> str:
+    """Load the user's 'generating-novel-research-ideas' skill body (frontmatter stripped).
+
+    Returns "" if the skill file isn't present, so this degrades gracefully on any box.
+    """
+    try:
+        from pathlib import Path
+        p = Path.home() / ".claude" / "skills" / "generating-novel-research-ideas" / "SKILL.md"
+        text = p.read_text(encoding="utf-8")
+    except Exception:
+        return ""
+    if text.lstrip().startswith("---"):  # strip YAML frontmatter
+        parts = text.split("---", 2)
+        if len(parts) == 3:
+            text = parts[2]
+    return text.strip()
+
+
+def _inject_novelty_method(prompt: str) -> str:
+    """Prepend the novel-idea methodology so the generator hunts for counterintuitive,
+    falsifiable claims (LLM as reverse-explainer) instead of shallow gap-filling."""
+    method = _load_novelty_method()
+    if not method:
+        return prompt
+    return (
+        "## HOW TO GENERATE NOVEL IDEAS — follow this methodology rigorously\n"
+        "Counterintuitive ideas are DISCOVERED via reproduction + perturbation of real "
+        "open-source baselines, NOT proposed from memory. Target a BELIEF TO FALSIFY, not a "
+        "gap to fill. Hunt for steps that are load-bearing in code but barely justified in the "
+        "paper. The LLM is a REVERSE-EXPLAINER of surprises, not an idea vending machine. Frame "
+        "each idea as a one-sentence counterintuitive claim an informed colleague would 'bet "
+        "against but isn't sure', name the baseline/step to probe, and how to test it.\n\n"
+        f"{method}\n\n"
+        "================= NOW DO THE TASK BELOW, GUIDED BY THE ABOVE =================\n\n"
+        f"{prompt}"
+    )
+
+
+def _idea_gen_raw(
+    prompt: str, cfg: dict, *, ctx_opts: dict, data_dir: str, topic_id: str, registry,
+) -> str:
+    """Stage-1 idea-generation text.
+
+    When ``agentic_retrieval`` is on, run the tool-using agent (it can look up the
+    cited insights papers' originals by [Pn] index and search local + arXiv for
+    more), falling back to one-shot ``call_cli`` if the agent yields nothing.
+    """
+    prompt = _inject_novelty_method(prompt)
+    if ctx_opts.get("agentic_retrieval"):
+        from paper_tracker import brainstorm_agent
+        manifest = _load_insights_manifest(
+            data_dir, topic_id, registry, ctx_opts.get("insights_session_id") or None)
+        raw = brainstorm_agent.generate_ideas(
+            prompt, manifest=manifest, data_dir=data_dir, topic_id=topic_id, cfg=cfg)
+        if raw:
+            log.info("Stage 1: agentic idea generation produced %d chars (manifest=%d papers)",
+                     len(raw), len(manifest))
+            return raw
+        log.warning("Stage 1: agentic idea generation empty — falling back to one-shot")
+    return call_cli(prompt, cfg)
 
 
 def run_brainstorm(
@@ -3183,7 +3431,9 @@ def run_brainstorm(
     extra_parts: list[str] = []
 
     if ctx_opts.get("use_insights"):
-        insights_text = _load_topic_insights(data_dir, topic_id, registry)
+        insights_text = _load_topic_insights(
+            data_dir, topic_id, registry, ctx_opts.get("insights_session_id") or None
+        )
         if insights_text:
             extra_parts.append(insights_text)
             log.info("Loaded topic insights (%d chars)", len(insights_text))
@@ -3266,7 +3516,8 @@ def run_brainstorm(
             extra_context=extra_context,
             user_idea=user_idea,
         )
-        raw = call_cli(prompt, cfg)
+        raw = _idea_gen_raw(prompt, cfg, ctx_opts=ctx_opts, data_dir=data_dir,
+                            topic_id=topic_id, registry=registry)
         if raw:
             ideas = _parse_ideas(raw, single=True, cfg=cfg)
         else:
@@ -3293,7 +3544,8 @@ def run_brainstorm(
                 discovery_context=discovery_context,
                 extra_context=extra_context,
             )
-        raw = call_cli(prompt, cfg)
+        raw = _idea_gen_raw(prompt, cfg, ctx_opts=ctx_opts, data_dir=data_dir,
+                            topic_id=topic_id, registry=registry)
         if raw:
             ideas = _parse_ideas(raw, single=False, cfg=cfg)
         else:
@@ -3357,24 +3609,30 @@ def run_brainstorm(
             idea.pop("_topic_name", None)
 
     # --- Stage 1b/1c: Review-Refinement Loop ---
-    # ACCEPT/DROP ideas are removed from the loop immediately.
-    # Only REVISE ideas continue to the next round.
+    # ACCEPT/DROP ideas are pulled out of the work-queue into their own pools.
+    # `remaining` is the work-queue for the next round; invariant: at any point,
+    # every input idea is in exactly one of {accepted_pool, dropped_pool, remaining}.
+    # Using a distinct variable from the outer `ideas` keeps the post-loop merge
+    # unambiguous — reassigning `ideas` inside the loop previously let the
+    # early-break path double-count ACCEPT ideas in the final merge.
     accepted_pool: list[dict] = []   # graduated ideas (ACCEPT)
     dropped_pool: list[dict] = []    # discarded ideas (DROP)
+    remaining: list[dict] = list(ideas)
 
-    if max_review_rounds > 0 and ideas:
+    if max_review_rounds > 0 and remaining:
         for round_num in range(1, max_review_rounds + 1):
             _progress("reviewing", message=f"Review round {round_num}/{max_review_rounds}...",
-                       ideas_count=len(ideas), round=round_num, total_rounds=max_review_rounds,
+                       ideas_count=len(remaining), round=round_num, total_rounds=max_review_rounds,
                        accepted=len(accepted_pool))
-            if not ideas:
+            if not remaining:
                 log.info("  No ideas left to review — exiting loop")
                 break
 
             log.info("Stage 1b: Review round %d/%d (%d ideas, %d already accepted)",
-                     round_num, max_review_rounds, len(ideas), len(accepted_pool))
+                     round_num, max_review_rounds, len(remaining), len(accepted_pool))
 
-            reviews = _review_ideas(ideas, topic_name, paper_summaries, n_papers, cfg)
+            reviews = _review_ideas(remaining, topic_name, paper_summaries, n_papers, cfg,
+                                    ctx_opts=ctx_opts, data_dir=data_dir, topic_id=topic_id)
             if not reviews:
                 log.warning("Review round %d failed, skipping remaining rounds", round_num)
                 break
@@ -3386,7 +3644,7 @@ def run_brainstorm(
             # Separate ACCEPT / CONDITIONAL_ACCEPT / DROP / REVISE
             revise_ideas: list[dict] = []
             revise_reviews: list[dict] = []
-            for i, idea in enumerate(ideas):
+            for i, idea in enumerate(remaining):
                 if i >= len(reviews):
                     revise_ideas.append(idea)
                     continue
@@ -3422,6 +3680,7 @@ def run_brainstorm(
             if not revise_ideas:
                 log.info("  All ideas resolved (no REVISE left) — exiting loop")
                 result["review_history"].append(round_record)
+                remaining = []
                 break
 
             # Refine only REVISE ideas
@@ -3437,15 +3696,15 @@ def run_brainstorm(
                 for j, ref in enumerate(refined):
                     if j < len(revise_ideas):
                         ref["_revise_streak"] = revise_ideas[j].get("_revise_streak", 0)
-                ideas = refined
+                remaining = refined
             else:
-                ideas = revise_ideas
+                remaining = revise_ideas
 
-            round_record["refined_count"] = len(ideas)
+            round_record["refined_count"] = len(remaining)
             result["review_history"].append(round_record)
 
-    # Merge: accepted first, then remaining REVISE, then dropped (kept for display)
-    ideas = accepted_pool + ideas + dropped_pool
+    # Merge: accepted first, then still-unresolved REVISE, then dropped (kept for display)
+    ideas = accepted_pool + remaining + dropped_pool
     result["ideas"] = ideas
     log.info("Review loop done: %d accepted, %d still REVISE, %d dropped",
              len(accepted_pool),
@@ -3481,6 +3740,7 @@ def run_brainstorm(
                 log.info("  Attempt 1: rescued %d ideas, reviewing", len(rescued))
                 rescue_reviews = _review_ideas(
                     rescued, topic_name, paper_summaries, n_papers, cfg,
+                    ctx_opts=ctx_opts, data_dir=data_dir, topic_id=topic_id,
                 )
                 if rescue_reviews:
                     rescue_verdicts = [r.get("verdict", "?") for r in rescue_reviews]
@@ -3518,6 +3778,7 @@ def run_brainstorm(
                     log.info("  Attempt 2: pivoted %d ideas, reviewing", len(pivoted))
                     pivot_reviews = _review_ideas(
                         pivoted, topic_name, paper_summaries, n_papers, cfg,
+                        ctx_opts=ctx_opts, data_dir=data_dir, topic_id=topic_id,
                     )
                     if pivot_reviews:
                         pivot_verdicts = [r.get("verdict", "?") for r in pivot_reviews]
@@ -3574,6 +3835,7 @@ def run_brainstorm(
         if polished:
             polish_reviews = _review_ideas(
                 polished, topic_name, paper_summaries, n_papers, cfg,
+                ctx_opts=ctx_opts, data_dir=data_dir, topic_id=topic_id,
             )
             if polish_reviews:
                 polish_verdicts = [r.get("verdict", "?") for r in polish_reviews]
@@ -3785,7 +4047,7 @@ def _parse_json_with_repair(
     log.info("JSON parse failed for %s, attempting LLM repair (%d chars)",
              label or "output", len(raw))
     repair_prompt = _JSON_REPAIR_PROMPT.format(broken_text=raw[:8000])
-    repaired = call_cli(repair_prompt, cfg, model="sonnet", timeout=60)
+    repaired = call_cli(repair_prompt, cfg, model="sonnet", timeout=120)
     if repaired:
         result = _parse_json_safe(repaired)
         if result is not None:

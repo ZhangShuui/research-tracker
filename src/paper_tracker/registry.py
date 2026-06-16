@@ -20,6 +20,8 @@ CREATE TABLE IF NOT EXISTS topics (
     github_lookback_days INTEGER DEFAULT 7,
     schedule_cron TEXT DEFAULT '',
     enabled INTEGER DEFAULT 1,
+    prefilter_enabled INTEGER DEFAULT 1,
+    prefilter_criteria TEXT DEFAULT '',
     created_at TEXT DEFAULT (datetime('now'))
 );
 
@@ -117,6 +119,8 @@ class Registry:
         self._migrate_chat_tables()
         self._migrate_deep_read_tables()
         self._migrate_session_error()
+        self._migrate_session_kind()
+        self._migrate_topic_prefilter()
         self._lock = threading.Lock()
 
     def _migrate_session_error(self) -> None:
@@ -124,6 +128,13 @@ class Registry:
         cols = {r[1] for r in self._conn.execute("PRAGMA table_info(sessions)").fetchall()}
         if "error_message" not in cols:
             self._conn.execute("ALTER TABLE sessions ADD COLUMN error_message TEXT DEFAULT ''")
+            self._conn.commit()
+
+    def _migrate_session_kind(self) -> None:
+        """Add kind column to sessions ('run' | 'manual') if missing."""
+        cols = {r[1] for r in self._conn.execute("PRAGMA table_info(sessions)").fetchall()}
+        if "kind" not in cols:
+            self._conn.execute("ALTER TABLE sessions ADD COLUMN kind TEXT DEFAULT 'run'")
             self._conn.commit()
 
     def _migrate_discovery_quality(self) -> None:
@@ -223,6 +234,15 @@ class Registry:
             self._conn.execute("ALTER TABLE deep_read_sessions ADD COLUMN repo_local_paths TEXT DEFAULT '[]'")
             self._conn.commit()
 
+    def _migrate_topic_prefilter(self) -> None:
+        """Add prefilter_enabled/prefilter_criteria columns to topics if missing."""
+        cols = {r[1] for r in self._conn.execute("PRAGMA table_info(topics)").fetchall()}
+        if "prefilter_enabled" not in cols:
+            self._conn.execute("ALTER TABLE topics ADD COLUMN prefilter_enabled INTEGER DEFAULT 1")
+        if "prefilter_criteria" not in cols:
+            self._conn.execute("ALTER TABLE topics ADD COLUMN prefilter_criteria TEXT DEFAULT ''")
+        self._conn.commit()
+
     def _migrate_topic_sources(self) -> None:
         """Add OpenAlex/OpenReview columns to topics if missing."""
         cols = {r[1] for r in self._conn.execute("PRAGMA table_info(topics)").fetchall()}
@@ -263,13 +283,15 @@ class Registry:
                     schedule_cron, enabled,
                     openalex_enabled, openalex_keywords, openalex_lookback_days, openalex_venues, openalex_max_results,
                     openreview_enabled, openreview_venues, openreview_keywords, openreview_max_results,
-                    search_date_from, search_date_to)
+                    search_date_from, search_date_to,
+                    prefilter_enabled, prefilter_criteria)
                    VALUES (:id, :name, :description, :arxiv_keywords, :arxiv_categories,
                            :arxiv_lookback_days, :github_keywords, :github_lookback_days,
                            :schedule_cron, :enabled,
                            :openalex_enabled, :openalex_keywords, :openalex_lookback_days, :openalex_venues, :openalex_max_results,
                            :openreview_enabled, :openreview_venues, :openreview_keywords, :openreview_max_results,
-                           :search_date_from, :search_date_to)""",
+                           :search_date_from, :search_date_to,
+                           :prefilter_enabled, :prefilter_criteria)""",
                 {
                     "id": topic["id"],
                     "name": topic["name"],
@@ -292,6 +314,8 @@ class Registry:
                     "openreview_max_results": topic.get("openreview_max_results", 100),
                     "search_date_from": topic.get("search_date_from", ""),
                     "search_date_to": topic.get("search_date_to", ""),
+                    "prefilter_enabled": 1 if topic.get("prefilter_enabled", True) else 0,
+                    "prefilter_criteria": topic.get("prefilter_criteria", ""),
                 },
             )
             self._conn.commit()
@@ -312,8 +336,9 @@ class Registry:
             "openreview_max_results": "openreview_max_results",
             "search_date_from": "search_date_from",
             "search_date_to": "search_date_to",
+            "prefilter_criteria": "prefilter_criteria",
         }
-        bool_fields = {"openalex_enabled", "openreview_enabled"}
+        bool_fields = {"openalex_enabled", "openreview_enabled", "prefilter_enabled"}
         list_fields = {
             "arxiv_keywords", "arxiv_categories", "github_keywords",
             "openalex_keywords", "openalex_venues",
@@ -356,11 +381,13 @@ class Registry:
 
     # ---- Sessions ----
 
-    def create_session(self, topic_id: str) -> dict:
+    def create_session(self, topic_id: str, kind: str = "run") -> dict:
         """Create a new session with auto-generated ID: YYYY-MM-DD_NNN.
 
-        The count-then-insert is wrapped in a mutex so concurrent calls for the
-        same topic on the same day each get a unique, incrementing session ID.
+        ``kind`` is 'run' for pipeline runs or 'manual' for hand-generated
+        insights. The count-then-insert is wrapped in a mutex so concurrent
+        calls for the same topic on the same day each get a unique,
+        incrementing session ID.
         """
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         now = datetime.now(timezone.utc).isoformat()
@@ -371,9 +398,9 @@ class Registry:
             ).fetchone()[0]
             session_id = f"{today}_{count + 1:03d}"
             self._conn.execute(
-                """INSERT INTO sessions (id, topic_id, started_at, status)
-                   VALUES (?, ?, ?, 'running')""",
-                (session_id, topic_id, now),
+                """INSERT INTO sessions (id, topic_id, started_at, status, kind)
+                   VALUES (?, ?, ?, 'running', ?)""",
+                (session_id, topic_id, now, kind),
             )
             self._conn.commit()
         return self.get_session(topic_id, session_id)
@@ -1008,6 +1035,7 @@ class Registry:
         d["enabled"] = bool(d.get("enabled", 1))
         d["openalex_enabled"] = bool(d.get("openalex_enabled", 0))
         d["openreview_enabled"] = bool(d.get("openreview_enabled", 0))
+        d["prefilter_enabled"] = bool(d.get("prefilter_enabled", 1))
         return d
 
     def close(self) -> None:

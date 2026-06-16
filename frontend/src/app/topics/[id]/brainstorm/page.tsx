@@ -17,10 +17,14 @@ import { IdeaCard } from "@/components/IdeaCard";
 import { VerificationResults } from "@/components/VerificationResults";
 import { BrainstormSessionCard } from "@/components/BrainstormSessionCard";
 
+// The boolean context toggles (excludes the non-boolean insights_session_id).
+type ToggleKey = Exclude<keyof ContextOptions, "insights_session_id">;
+
 const CONTEXT_TOGGLES: {
-  key: keyof ContextOptions;
+  key: ToggleKey;
   label: string;
   description: string;
+  default?: boolean;
 }[] = [
   {
     key: "use_insights",
@@ -62,19 +66,32 @@ const CONTEXT_TOGGLES: {
     label: "Novelty Map",
     description: "Multi-axis novelty analysis (problem/method/eval/theory/setting)",
   },
+  {
+    key: "agentic_retrieval",
+    label: "Agentic Retrieval",
+    description: "Let the idea generator look up cited papers' originals + search the KB & arXiv for more",
+  },
+  {
+    key: "agentic_review",
+    label: "Agentic Review",
+    description: "Let the idea judge investigate prior work (arXiv + local) during review — heavier, off by default",
+    default: false,
+  },
 ];
 
 const STORAGE_KEY = "brainstorm-context-options";
 
 function loadContextOptions(): ContextOptions {
   if (typeof window === "undefined") return {};
+  // Default: all on. Merge stored OVER defaults so newly-added toggles (e.g.
+  // agentic_retrieval) default ON even for returning users — an explicit OFF in
+  // storage still wins.
+  const defaults: ContextOptions = {};
+  for (const t of CONTEXT_TOGGLES) defaults[t.key] = t.default ?? true;
   try {
     const stored = localStorage.getItem(STORAGE_KEY);
-    if (stored) return JSON.parse(stored);
+    if (stored) return { ...defaults, ...JSON.parse(stored) };
   } catch {}
-  // Default: all on
-  const defaults: ContextOptions = {};
-  for (const t of CONTEXT_TOGGLES) defaults[t.key] = true;
   return defaults;
 }
 
@@ -99,13 +116,22 @@ export default function BrainstormPage() {
     saveContextOptions(contextOpts);
   }, [contextOpts]);
 
-  const enabledCount = Object.values(contextOpts).filter(Boolean).length;
+  const enabledCount = CONTEXT_TOGGLES.filter((t) => contextOpts[t.key]).length;
 
   const { data: sessionsData } = useQuery({
     queryKey: ["brainstorm-sessions", id],
     queryFn: () => api.listBrainstormSessions(id),
     refetchInterval: 3_000,
   });
+
+  // Topic run/manual sessions that have an insights memo (for the picker below).
+  const { data: runSessionsData } = useQuery({
+    queryKey: ["sessions", id],
+    queryFn: () => api.getSessions(id, 100),
+  });
+  const insightSessions = (runSessionsData?.sessions ?? []).filter(
+    (s) => s.insights_path
+  );
 
   const sessions = sessionsData?.sessions ?? [];
   const selected = sessions.find((s) => s.id === selectedId) ?? sessions[0] ?? null;
@@ -158,14 +184,16 @@ export default function BrainstormPage() {
 
   const isPending = autoMut.isPending || userMut.isPending || hasRunning;
 
-  function toggleContext(key: keyof ContextOptions) {
+  function toggleContext(key: ToggleKey) {
     setContextOpts((prev) => ({ ...prev, [key]: !prev[key] }));
   }
 
   function toggleAll(on: boolean) {
-    const next: ContextOptions = {};
-    for (const t of CONTEXT_TOGGLES) next[t.key] = on;
-    setContextOpts(next);
+    setContextOpts((prev) => {
+      const next: ContextOptions = { ...prev };
+      for (const t of CONTEXT_TOGGLES) next[t.key] = on;
+      return next;
+    });
   }
 
   return (
@@ -282,6 +310,33 @@ export default function BrainstormPage() {
                 </label>
               ))}
             </div>
+
+            {/* Which insights memo to feed in (only when Topic Insights is on) */}
+            {contextOpts.use_insights && insightSessions.length > 0 && (
+              <div className="pt-2 mt-1 border-t border-slate-200">
+                <label className="text-[11px] font-medium text-slate-600 block mb-1">
+                  Insights memo to use
+                </label>
+                <select
+                  value={contextOpts.insights_session_id ?? ""}
+                  onChange={(e) =>
+                    setContextOpts((prev) => ({
+                      ...prev,
+                      insights_session_id: e.target.value,
+                    }))
+                  }
+                  className="w-full text-xs rounded-lg border border-slate-300 bg-white px-2 py-1.5 text-slate-700 focus:outline-none focus:ring-2 focus:ring-indigo-400"
+                >
+                  <option value="">Latest (default)</option>
+                  {insightSessions.map((s) => (
+                    <option key={s.id} value={s.id}>
+                      {s.id} · {s.paper_count} papers
+                      {s.kind === "manual" ? " · manual" : ""}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            )}
           </div>
         )}
       </div>

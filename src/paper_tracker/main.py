@@ -94,6 +94,7 @@ def run_pipeline(
 
             raw_papers: list[dict] = []
             raw_repos: list[dict] = []
+            source_errors: dict[str, str] = {}
             sources_done = 0
 
             # Collect arXiv papers
@@ -107,6 +108,7 @@ def run_pipeline(
                 raise
             except Exception as e:
                 log.error("arXiv source failed: %s", e)
+                source_errors["arxiv"] = f"{type(e).__name__}: {e}"
                 sources_done += 1
 
             # Collect GitHub repos
@@ -120,6 +122,7 @@ def run_pipeline(
                 raise
             except Exception as e:
                 log.error("GitHub source failed: %s", e)
+                source_errors["github"] = f"{type(e).__name__}: {e}"
                 sources_done += 1
 
             # Collect OpenAlex papers
@@ -135,6 +138,7 @@ def run_pipeline(
                     raise
                 except Exception as e:
                     log.error("OpenAlex source failed: %s", e)
+                    source_errors["openalex"] = f"{type(e).__name__}: {e}"
                     sources_done += 1
 
             # Collect OpenReview papers
@@ -150,6 +154,7 @@ def run_pipeline(
                     raise
                 except Exception as e:
                     log.error("OpenReview source failed: %s", e)
+                    source_errors["openreview"] = f"{type(e).__name__}: {e}"
                     sources_done += 1
 
         log.info("Fetched %d total papers, %d GitHub repos", len(raw_papers), len(raw_repos))
@@ -184,12 +189,25 @@ def run_pipeline(
 
         log.info("After dedup: %d new papers, %d new repos", len(new_papers), len(new_repos))
 
+        # Surface source failures: a run that "completes" while a source was
+        # down (e.g. arXiv rate-limited us with HTTP 429) must not look
+        # identical to one that genuinely found nothing.
+        status = "completed"
+        error_message = ""
+        if source_errors:
+            status = "partial"
+            failed = "; ".join(f"{name}: {err}" for name, err in source_errors.items())
+            error_message = f"Some sources failed; results may be incomplete. ({failed})"
+            log.warning("Run degraded — source failures: %s", failed)
+
         result: dict = {
             "paper_count": len(new_papers),
             "repo_count": len(new_repos),
             "report_path": "",
             "insights_path": "",
-            "status": "completed",
+            "status": status,
+            "error_message": error_message,
+            "source_errors": source_errors,
         }
 
         if not new_papers and not new_repos:
@@ -197,6 +215,30 @@ def run_pipeline(
             _progress("completed", message="No new papers or repos found.",
                       papers_new=0, repos_new=0)
             return result
+
+        # 2.5. Early relevance prefilter — drop off-topic papers before summarize.
+        # Only looks at title+abstract, uses sonnet, cheaper than per-paper summarize.
+        if new_papers and search_cfg.get("prefilter_enabled", True):
+            _progress("prefiltering",
+                      message=f"Prefiltering {len(new_papers)} papers for relevance...",
+                      papers_total=len(new_papers), papers_done=0)
+            before = len(new_papers)
+            new_papers = summarizer.prefilter_by_relevance(
+                new_papers, topic_cfg, topic_name,
+                description=search_cfg.get("description", ""),
+                criteria=search_cfg.get("prefilter_criteria", ""),
+                keywords=search_cfg.get("arxiv_keywords", []),
+            )
+            dropped = before - len(new_papers)
+            log.info("Prefilter: %d/%d papers kept (dropped %d)",
+                     len(new_papers), before, dropped)
+            result["paper_count"] = len(new_papers)
+            if not new_papers and not new_repos:
+                log.info("All papers prefiltered out and no new repos.")
+                _progress("completed",
+                          message=f"Prefilter dropped all {before} papers.",
+                          papers_new=0, repos_new=0)
+                return result
 
         # 3. Summarize
         _progress("summarizing", message=f"Summarizing {len(new_papers)} papers...",

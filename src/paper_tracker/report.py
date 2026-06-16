@@ -124,7 +124,7 @@ def generate(
             n=len(papers),
             paper_block=paper_block,
         )
-        exec_summary = call_cli(exec_prompt, cfg, timeout=180)
+        exec_summary = call_cli(exec_prompt, cfg, timeout=600)
         if exec_summary:
             lines.append("## Executive Summary\n")
             lines.append(exec_summary)
@@ -145,7 +145,7 @@ def generate(
             n=len(papers),
             paper_block=_build_paper_block(papers),
         )
-        thematic = call_cli(thematic_prompt, cfg, timeout=180)
+        thematic = call_cli(thematic_prompt, cfg, timeout=600)
         if thematic:
             lines.append("## Thematic Analysis\n")
             lines.append(thematic)

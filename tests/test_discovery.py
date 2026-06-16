@@ -167,7 +167,7 @@ class TestRunTrending:
 
         run_trending(reg, _CFG)
         mock_cli.assert_called_once()
-        assert mock_cli.call_args[1]["timeout"] == 360
+        assert mock_cli.call_args[1]["timeout"] == 600
 
     @patch("paper_tracker.discovery.fetch_pwc_trending", side_effect=Exception("Network error"))
     @patch("paper_tracker.discovery.fetch_daily_papers")

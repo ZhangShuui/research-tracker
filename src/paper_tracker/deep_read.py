@@ -532,5 +532,5 @@ Provide a clear, thorough answer. Reference specific parts of the paper or your 
 Use markdown formatting. Include equations in LaTeX if helpful.
 Output ONLY the answer, no preamble.{_lang_suffix(language)}"""
 
-    answer = call_cli(prompt, cfg, model="opus", timeout=120) or "Sorry, I was unable to generate an answer."
+    answer = call_cli(prompt, cfg, model="opus", timeout=300) or "Sorry, I was unable to generate an answer."
     return {"content": answer}

@@ -8,25 +8,57 @@ from unittest.mock import patch, MagicMock
 
 import pytest
 
-from paper_tracker.sources.arxiv import search_broad, _parse_entries
+import httpx
+
+from paper_tracker.sources import httpx_get_with_retry, DEFAULT_USER_AGENT
+from paper_tracker.sources.arxiv import (
+    search_broad,
+    search as arxiv_search,
+    _parse_entries,
+    extract_arxiv_id,
+    fetch_by_id,
+    fetch_many_by_id,
+)
 from paper_tracker.sources.huggingface import fetch_daily_papers
 from paper_tracker.sources.openalex import _parse_item as oa_parse_item
 from paper_tracker.sources.paperswithcode import fetch_trending
+
+
+def _status_error(code: int, headers: dict | None = None) -> httpx.HTTPStatusError:
+    """Build an httpx.HTTPStatusError whose response carries *code* + *headers*."""
+    resp = MagicMock()
+    resp.status_code = code
+    resp.headers = headers or {}
+    return httpx.HTTPStatusError(f"HTTP {code}", request=MagicMock(), response=resp)
+
+
+def _resp(text: str = "", *, raises: Exception | None = None) -> MagicMock:
+    r = MagicMock()
+    r.text = text
+    r.raise_for_status = MagicMock(side_effect=raises)
+    return r
 
 
 # ---------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------
 
+_RECENT_PUBLISHED = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def _make_arxiv_xml(entries: list[dict]) -> str:
-    """Build a minimal arXiv Atom XML response."""
+    """Build a minimal arXiv Atom XML response.
+
+    Default ``published`` is yesterday UTC so entries survive any reasonable
+    lookback window in tests without needing to be refreshed over time.
+    """
     lines = ['<?xml version="1.0" encoding="UTF-8"?>',
              '<feed xmlns="http://www.w3.org/2005/Atom">']
     for e in entries:
         lines.append(f"""
   <entry>
     <id>http://arxiv.org/abs/{e['id']}v1</id>
-    <published>{e.get('published', '2026-03-04T00:00:00Z')}</published>
+    <published>{e.get('published', _RECENT_PUBLISHED)}</published>
     <title>{e.get('title', 'Test Paper')}</title>
     <summary>{e.get('abstract', 'An abstract.')}</summary>
     <author><name>{e.get('author', 'Author A')}</name></author>
@@ -53,9 +85,11 @@ class TestParseEntries:
         assert papers[0]["doi"] == "10.48550/arxiv.2603.01234"
 
     def test_filters_old_papers(self):
+        recent = (datetime.now(timezone.utc) - timedelta(days=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        old = (datetime.now(timezone.utc) - timedelta(days=60)).strftime("%Y-%m-%dT%H:%M:%SZ")
         xml = _make_arxiv_xml([
-            {"id": "2603.01234", "published": "2026-03-04T00:00:00Z"},
-            {"id": "2401.99999", "published": "2024-01-01T00:00:00Z"},
+            {"id": "2603.01234", "published": recent},
+            {"id": "2401.99999", "published": old},
         ])
         root = ET.fromstring(xml)
         cutoff = datetime.now(timezone.utc) - timedelta(days=7)
@@ -376,3 +410,283 @@ class TestPapersWithCodeFetch:
         fetch_trending(max_papers=25)
         call_kwargs = mock_get.call_args
         assert call_kwargs[1]["params"]["items_per_page"] == 25
+
+
+# ---------------------------------------------------------------
+# httpx_get_with_retry — User-Agent + 429/503 backoff (arXiv hardening)
+# ---------------------------------------------------------------
+
+class TestHttpxGetWithRetry:
+    @patch("paper_tracker.sources.httpx.get")
+    def test_sends_descriptive_user_agent(self, mock_get):
+        mock_get.return_value = _resp("ok")
+        httpx_get_with_retry("https://example.com")
+        sent_headers = mock_get.call_args[1]["headers"]
+        assert sent_headers["User-Agent"] == DEFAULT_USER_AGENT
+        assert "paper-tracker" in sent_headers["User-Agent"]
+
+    @patch("paper_tracker.sources.httpx.get")
+    def test_caller_headers_override_default_ua(self, mock_get):
+        mock_get.return_value = _resp("ok")
+        httpx_get_with_retry("https://example.com", headers={"User-Agent": "custom/1.0"})
+        assert mock_get.call_args[1]["headers"]["User-Agent"] == "custom/1.0"
+
+    @patch("paper_tracker.sources.time.sleep")
+    @patch("paper_tracker.sources.httpx.get")
+    def test_retries_on_429_then_succeeds(self, mock_get, mock_sleep):
+        mock_get.side_effect = [
+            _resp(raises=_status_error(429)),
+            _resp(raises=_status_error(429)),
+            _resp("finally"),
+        ]
+        resp = httpx_get_with_retry("https://export.arxiv.org/api/query")
+        assert resp.text == "finally"
+        assert mock_get.call_count == 3
+        assert mock_sleep.call_count == 2  # backed off before each retry
+
+    @patch("paper_tracker.sources.time.sleep")
+    @patch("paper_tracker.sources.httpx.get")
+    def test_retries_on_503(self, mock_get, mock_sleep):
+        # arXiv historically threw 503 when throttling — must also be retried.
+        mock_get.side_effect = [_resp(raises=_status_error(503)), _resp("ok")]
+        resp = httpx_get_with_retry("https://export.arxiv.org/api/query")
+        assert resp.text == "ok"
+        assert mock_get.call_count == 2
+
+    @patch("paper_tracker.sources.time.sleep")
+    @patch("paper_tracker.sources.httpx.get")
+    def test_honors_retry_after_header(self, mock_get, mock_sleep):
+        mock_get.side_effect = [
+            _resp(raises=_status_error(429, headers={"Retry-After": "7"})),
+            _resp("ok"),
+        ]
+        httpx_get_with_retry("https://export.arxiv.org/api/query")
+        # First (and only) backoff should wait exactly the server-asked 7s.
+        assert mock_sleep.call_args_list[0][0][0] == 7.0
+
+    @patch("paper_tracker.sources.time.sleep")
+    @patch("paper_tracker.sources.httpx.get")
+    def test_raises_after_exhausting_retries(self, mock_get, mock_sleep):
+        mock_get.side_effect = [_resp(raises=_status_error(429)) for _ in range(5)]
+        with pytest.raises(httpx.HTTPStatusError):
+            httpx_get_with_retry("https://export.arxiv.org/api/query", retries=5)
+        assert mock_get.call_count == 5
+
+    @patch("paper_tracker.sources.time.sleep")
+    @patch("paper_tracker.sources.httpx.get")
+    def test_does_not_retry_client_errors(self, mock_get, mock_sleep):
+        mock_get.side_effect = [_resp(raises=_status_error(404))]
+        with pytest.raises(httpx.HTTPStatusError):
+            httpx_get_with_retry("https://example.com")
+        assert mock_get.call_count == 1
+        assert mock_sleep.call_count == 0
+
+
+# ---------------------------------------------------------------
+# arxiv.search — distinguishes total failure from empty result
+# ---------------------------------------------------------------
+
+class TestArxivSearchFailureSignal:
+    def _cfg(self) -> dict:
+        return {"search": {
+            "arxiv_keywords": ["world model"],
+            "arxiv_categories": ["cs.CV"],
+            "arxiv_lookback_days": 30,
+        }}
+
+    @patch("paper_tracker.sources.arxiv.httpx_get_with_retry")
+    def test_total_failure_raises(self, mock_fetch):
+        """First request fails → raise so the pipeline can flag the source."""
+        mock_fetch.side_effect = httpx.HTTPError("arXiv 429/timeout")
+        with pytest.raises(httpx.HTTPError):
+            arxiv_search(self._cfg())
+
+    @patch("paper_tracker.sources.arxiv.time.sleep")
+    @patch("paper_tracker.sources.arxiv.httpx_get_with_retry")
+    def test_partial_failure_returns_what_was_fetched(self, mock_fetch, mock_sleep):
+        """Later page fails after page 1 succeeded → return the partial result."""
+        page1 = _resp(_make_arxiv_xml([{"id": f"2603.{i:05d}"} for i in range(100)]))
+        mock_fetch.side_effect = [page1, httpx.HTTPError("page 2 failed")]
+        papers = arxiv_search(self._cfg())
+        assert len(papers) == 100  # page 1 kept, no exception raised
+
+    @patch("paper_tracker.sources.arxiv.httpx_get_with_retry")
+    def test_genuine_empty_returns_empty(self, mock_fetch):
+        """API responds fine with zero entries → empty list, no exception."""
+        mock_fetch.return_value = _resp(_make_arxiv_xml([]))
+        assert arxiv_search(self._cfg()) == []
+
+
+# ---------------------------------------------------------------
+# OpenReview — venue listing + local keyword filter (no date floor)
+# ---------------------------------------------------------------
+
+class TestOpenReviewVenueListing:
+    def _notes_resp(self, notes):
+        r = MagicMock()
+        r.json.return_value = {"notes": notes}
+        return r
+
+    def _note(self, title, abstract="", fid="f1"):
+        return {"forum": fid, "id": fid, "cdate": 1700000000000,
+                "content": {"title": {"value": title}, "abstract": {"value": abstract}}}
+
+    @patch("paper_tracker.sources.openreview_api.time.sleep")
+    @patch("paper_tracker.sources.openreview_api.httpx_get_with_retry")
+    def test_keyword_filters_venue_notes_locally(self, mock_get, mock_sleep):
+        from paper_tracker.sources.openreview_api import search
+        notes = [
+            self._note("A video world model for control", fid="f1"),
+            self._note("Unrelated parsing paper", abstract="syntax trees", fid="f2"),
+            self._note("Controllable video generation", fid="f3"),
+        ]
+        mock_get.return_value = self._notes_resp(notes)  # <100 notes → single page
+        cfg = {"search": {"openreview_venues": ["iclr2025"],
+                          "openreview_keywords": ["world model", "video generation"],
+                          "openreview_max_results": 10}}
+        titles = [p["title"] for p in search(cfg)]
+        assert "A video world model for control" in titles
+        assert "Controllable video generation" in titles
+        assert "Unrelated parsing paper" not in titles
+
+    @patch("paper_tracker.sources.openreview_api.time.sleep")
+    @patch("paper_tracker.sources.openreview_api.httpx_get_with_retry")
+    def test_queries_by_venueid_and_ignores_date_floor(self, mock_get, mock_sleep):
+        from paper_tracker.sources.openreview_api import search
+        # cdate ~2023 (well before the date floor) must NOT be filtered out.
+        old = {"forum": "f9", "id": "f9", "cdate": 1690000000000,
+               "content": {"title": {"value": "world model paper"}, "abstract": {"value": ""}}}
+        mock_get.return_value = self._notes_resp([old])
+        cfg = {"search": {"openreview_venues": ["neurips2025"],
+                          "openreview_keywords": ["world model"],
+                          "openreview_max_results": 10,
+                          "search_date_from": "2025-06-01"}}  # floor must be ignored here
+        papers = search(cfg)
+        assert len(papers) == 1
+        # venueid-based query, not the cross-venue /search endpoint
+        assert mock_get.call_args[1]["params"]["content.venueid"] == "NeurIPS.cc/2025/Conference"
+
+    @patch("paper_tracker.sources.openreview_api.time.sleep")
+    @patch("paper_tracker.sources.openreview_api.httpx_get_with_retry")
+    def test_no_keywords_keeps_all(self, mock_get, mock_sleep):
+        from paper_tracker.sources.openreview_api import search
+        mock_get.return_value = self._notes_resp([self._note("anything", fid="f1")])
+        cfg = {"search": {"openreview_venues": ["icml2025"],
+                          "openreview_keywords": [], "arxiv_keywords": [],
+                          "openreview_max_results": 10}}
+        assert len(search(cfg)) == 1
+
+    def test_no_venues_returns_empty(self):
+        from paper_tracker.sources.openreview_api import search
+        cfg = {"search": {"openreview_venues": [], "openreview_keywords": ["x"]}}
+        assert search(cfg) == []
+
+
+# ---------------------------------------------------------------
+# extract_arxiv_id — normalize raw IDs / URLs to a bare arXiv ID
+# ---------------------------------------------------------------
+
+class TestExtractArxivId:
+    @pytest.mark.parametrize("raw,expected", [
+        ("2401.12345", "2401.12345"),
+        ("2401.12345v3", "2401.12345"),
+        ("  2401.12345  ", "2401.12345"),
+        ("arXiv:2401.12345", "2401.12345"),
+        ("ARXIV: 2401.12345", "2401.12345"),
+        ("https://arxiv.org/abs/2401.12345", "2401.12345"),
+        ("https://arxiv.org/abs/2401.12345v2", "2401.12345"),
+        ("http://export.arxiv.org/abs/2401.12345", "2401.12345"),
+        ("https://arxiv.org/pdf/2401.12345.pdf", "2401.12345"),
+        ("https://arxiv.org/pdf/2401.12345", "2401.12345"),
+        ("2401.1234", "2401.1234"),          # 4-digit (older) sequence
+        ("hep-th/9901001", "hep-th/9901001"),  # legacy id scheme
+        ("cs.AI/0501001", "cs.AI/0501001"),
+        ("not a paper", ""),
+        ("", ""),
+    ])
+    def test_extract(self, raw, expected):
+        assert extract_arxiv_id(raw) == expected
+
+
+# ---------------------------------------------------------------
+# fetch_by_id — single-paper metadata lookup via id_list
+# ---------------------------------------------------------------
+
+class TestFetchById:
+    @patch("paper_tracker.sources.arxiv.httpx_get_with_retry")
+    def test_returns_normalized_paper(self, mock_get):
+        xml = _make_arxiv_xml([{
+            "id": "2401.12345",
+            "title": "A Manual Paper",
+            "abstract": "Some abstract.",
+            "author": "Jane Doe",
+            "published": "2024-01-15T00:00:00Z",
+        }])
+        mock_get.return_value = _resp(xml)
+
+        paper = fetch_by_id("https://arxiv.org/abs/2401.12345")
+
+        assert paper is not None
+        assert paper["arxiv_id"] == "2401.12345"
+        assert paper["title"] == "A Manual Paper"
+        assert paper["authors"] == "Jane Doe"
+        assert paper["published"] == "2024-01-15"  # normalized to YYYY-MM-DD
+        assert paper["url"] == "https://arxiv.org/abs/2401.12345"
+        # request used the cleaned id, not the raw URL
+        assert mock_get.call_args.kwargs["params"]["id_list"] == "2401.12345"
+
+    @patch("paper_tracker.sources.arxiv.httpx_get_with_retry")
+    def test_not_found_returns_none(self, mock_get):
+        mock_get.return_value = _resp(_make_arxiv_xml([]))
+        assert fetch_by_id("2401.00000") is None
+
+    @patch("paper_tracker.sources.arxiv.httpx_get_with_retry")
+    def test_id_mismatch_returns_none(self, mock_get):
+        # arXiv echoes a different/error id for unknown requests
+        mock_get.return_value = _resp(_make_arxiv_xml([{"id": "2401.99999"}]))
+        assert fetch_by_id("2401.12345") is None
+
+    @patch("paper_tracker.sources.arxiv.httpx_get_with_retry")
+    def test_unparseable_input_skips_request(self, mock_get):
+        assert fetch_by_id("just some text") is None
+        mock_get.assert_not_called()
+
+    @patch("paper_tracker.sources.arxiv.httpx_get_with_retry",
+           side_effect=httpx.HTTPError("503"))
+    def test_http_error_propagates(self, mock_get):
+        with pytest.raises(httpx.HTTPError):
+            fetch_by_id("2401.12345")
+
+
+class TestFetchManyById:
+    @patch("paper_tracker.sources.arxiv.httpx_get_with_retry")
+    def test_fetches_in_one_request(self, mock_get):
+        xml = _make_arxiv_xml([
+            {"id": "2401.11111", "title": "P1", "published": "2024-01-01T00:00:00Z"},
+            {"id": "2401.22222", "title": "P2", "published": "2024-02-02T00:00:00Z"},
+        ])
+        mock_get.return_value = _resp(xml)
+        out = fetch_many_by_id(["https://arxiv.org/abs/2401.11111", "arXiv:2401.22222v3"])
+        assert set(out.keys()) == {"2401.11111", "2401.22222"}
+        assert out["2401.11111"]["title"] == "P1"
+        assert out["2401.22222"]["published"] == "2024-02-02"  # normalized
+        assert mock_get.call_count == 1
+        assert mock_get.call_args.kwargs["params"]["id_list"] == "2401.11111,2401.22222"
+
+    @patch("paper_tracker.sources.arxiv.httpx_get_with_retry")
+    def test_dedups_and_skips_invalid(self, mock_get):
+        mock_get.return_value = _resp(_make_arxiv_xml([{"id": "2401.11111"}]))
+        out = fetch_many_by_id(["2401.11111", "2401.11111", "not-an-id", ""])
+        assert list(out.keys()) == ["2401.11111"]
+        assert mock_get.call_args.kwargs["params"]["id_list"] == "2401.11111"
+
+    def test_all_invalid_makes_no_request(self):
+        with patch("paper_tracker.sources.arxiv.httpx_get_with_retry") as mock_get:
+            assert fetch_many_by_id(["nope", "also nope", ""]) == {}
+            mock_get.assert_not_called()
+
+    @patch("paper_tracker.sources.arxiv.httpx_get_with_retry")
+    def test_unknown_id_absent(self, mock_get):
+        mock_get.return_value = _resp(_make_arxiv_xml([{"id": "2401.11111"}]))
+        out = fetch_many_by_id(["2401.11111", "2401.99999"])
+        assert "2401.11111" in out and "2401.99999" not in out

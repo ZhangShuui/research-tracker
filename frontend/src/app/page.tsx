@@ -64,6 +64,14 @@ export default function DashboardPage() {
               </p>
             </div>
             <div className="flex items-center gap-2">
+              <Link
+                href="/crossdomain"
+                className="flex items-center gap-1.5 px-3 py-2.5 rounded-lg bg-white/10 hover:bg-white/20 text-white/80 hover:text-white transition-all backdrop-blur-sm text-sm font-medium"
+                title="Cross-domain knowledge base"
+              >
+                <Sigma size={16} />
+                Cross-domain KB
+              </Link>
               <button
                 onClick={() => refetch()}
                 disabled={isFetching}

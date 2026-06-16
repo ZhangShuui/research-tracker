@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { Sigma, Play, RefreshCw, Clock, Settings, ChevronDown, ChevronRight } from "lucide-react";
+import { Sigma, Play, RefreshCw, Clock, Settings, ChevronDown, ChevronRight, Plus } from "lucide-react";
 import { api, DiscoveryReport } from "@/lib/api";
 import { DiscoveryPanel } from "@/components/DiscoveryPanel";
 
@@ -102,6 +102,19 @@ export default function MathInsightsPage() {
       qc.invalidateQueries({ queryKey: ["discovery", "math"] });
     },
   });
+
+  // Promote a report's papers into the cross-domain knowledge base.
+  const addToKbMut = useMutation({
+    mutationFn: (reportId: string) => api.importReportToCorpus(reportId),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["corpus-import"] }),
+  });
+  const { data: kbImport } = useQuery({
+    queryKey: ["corpus-import"],
+    queryFn: () => api.getCorpusImportStatus(),
+    refetchInterval: 3_000,
+  });
+  const kbJob = kbImport?.job;
+  const kbImporting = kbJob?.status === "running";
 
   function toggleCat(list: string[], setList: (v: string[]) => void, id: string) {
     setList(list.includes(id) ? list.filter((c) => c !== id) : [...list, id]);
@@ -344,6 +357,32 @@ export default function MathInsightsPage() {
                 Math & Statistics Insights
               </h2>
             </div>
+            {displayReport.status === "completed" && displayReport.paper_count > 0 && (
+              <div className="mb-4 flex flex-wrap items-center gap-3 rounded-lg bg-indigo-50 border border-indigo-100 p-3">
+                <button
+                  onClick={() => addToKbMut.mutate(displayReport.id)}
+                  disabled={kbImporting || addToKbMut.isPending}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-lg bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-50 font-medium"
+                >
+                  {kbImporting ? <RefreshCw size={13} className="animate-spin" /> : <Plus size={13} />}
+                  Add to knowledge base
+                </button>
+                <span className="text-xs text-indigo-700">
+                  Screens these {displayReport.paper_count} papers (opus) and adds the theoretical ones to the cross-domain corpus.
+                </span>
+                {kbJob && kbJob.status !== "idle" && (
+                  <span className="text-xs text-gray-500 ml-auto">
+                    {kbJob.status === "running"
+                      ? `adding… +${kbJob.added ?? 0} kept, ${kbJob.skipped ?? 0} skipped (${kbJob.processed ?? 0}/${kbJob.total ?? 0})`
+                      : kbJob.status === "completed"
+                      ? `done — ${kbJob.added ?? 0} added, ${kbJob.skipped ?? 0} skipped`
+                      : kbJob.status === "failed"
+                      ? "import failed"
+                      : ""}
+                  </span>
+                )}
+              </div>
+            )}
             <DiscoveryPanel
               report={displayReport}
               onReview={() => reviewMut.mutate(displayReport.id)}

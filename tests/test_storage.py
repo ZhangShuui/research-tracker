@@ -302,3 +302,47 @@ class TestDoiDedup:
             paper_id="doi:10.48550/arxiv.2401.12345",
             doi="https://doi.org/10.48550/arxiv.2401.12345",
         ) is True
+
+
+# ---------------------------------------------------------------
+# update_arxiv_summary — write back descriptive fields after summarize
+# ---------------------------------------------------------------
+
+class TestUpdateArxivSummary:
+    def test_round_trip(self, store: Storage):
+        store.insert_arxiv(_make_paper(
+            "2501.00010", summary="", key_insight="", method="",
+            contribution="", math_concepts=[], venue="", cited_works=[],
+        ))
+        ok = store.update_arxiv_summary("2501.00010", {
+            "summary": "New summary.",
+            "key_insight": "Key.",
+            "method": "Method.",
+            "contribution": "Contribution.",
+            "math_concepts": ["a", "b"],
+            "venue": "ICML 2025",
+            "cited_works": ["X et al."],
+        })
+        assert ok is True
+        got = store.get_arxiv("2501.00010")
+        assert got["summary"] == "New summary."
+        assert got["key_insight"] == "Key."
+        assert got["venue"] == "ICML 2025"
+        assert got["math_concepts"] == ["a", "b"]   # decoded back to a list
+        assert got["cited_works"] == ["X et al."]
+
+    def test_partial_update_leaves_other_fields(self, store: Storage):
+        store.insert_arxiv(_make_paper("2501.00012"))
+        store.update_arxiv_summary("2501.00012", {"summary": "Only this changed."})
+        got = store.get_arxiv("2501.00012")
+        assert got["summary"] == "Only this changed."
+        assert got["key_insight"] == "Something new."  # untouched
+
+    def test_unknown_columns_are_ignored(self, store: Storage):
+        store.insert_arxiv(_make_paper("2501.00011"))
+        # 'title' is not an allowed summary column -> filtered out -> no-op
+        assert store.update_arxiv_summary("2501.00011", {"title": "hacked"}) is False
+        assert store.get_arxiv("2501.00011")["title"] == "Paper 2501.00011"
+
+    def test_missing_row_returns_false(self, store: Storage):
+        assert store.update_arxiv_summary("nope", {"summary": "x"}) is False

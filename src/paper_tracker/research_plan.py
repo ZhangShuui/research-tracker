@@ -99,7 +99,7 @@ def curate_papers_for_idea(papers: list[dict], idea: dict, cfg: dict) -> str:
     log.info("Paper curation: %d papers, catalog %d chars, prompt %d chars",
              len(papers), len(catalog), len(prompt))
 
-    result = call_cli(prompt, cfg, timeout=180)
+    result = call_cli(prompt, cfg, timeout=600)
     if result:
         log.info("Paper curation done: %d chars of curated context", len(result))
         return result
@@ -1070,7 +1070,7 @@ def generate_research_plan(
     if exp_json_raw:
         # Convert JSON to Markdown
         exp_md_prompt = _EXPERIMENT_MARKDOWN_PROMPT.format(json_data=exp_json_raw)
-        exp_md = _call(exp_md_prompt, "exp_md", timeout=240)
+        exp_md = _call(exp_md_prompt, "exp_md", timeout=600)
         result["experimental_design"] = _strip_leading_heading(exp_md or exp_json_raw)
     else:
         result["experimental_design"] = ""
@@ -1293,7 +1293,7 @@ def _run_consistency_review(sections: dict, cfg: dict) -> str:
         experimental_design=_truncate(sections.get("experimental_design", ""), 3000),
         expected_results=_truncate(sections.get("expected_results", ""), 2000),
     )
-    raw = call_cli(prompt, cfg, timeout=240)
+    raw = call_cli(prompt, cfg, timeout=600)
     return raw or ""
 
 
@@ -1583,7 +1583,7 @@ def _run_peer_review(
             calibration=calibration,
             review_history_block=review_history_block,
         )
-        raw = _call(prompt, f"reviewer_{role[:8]}", timeout=360)
+        raw = _call(prompt, f"reviewer_{role[:8]}", timeout=600)
         parsed = _parse_reviewer_json(raw) if raw else None
         if parsed:
             parsed = _normalize_review_json(parsed)
@@ -1615,7 +1615,7 @@ def _run_peer_review(
             previous_review_json=json.dumps(parsed, indent=2),
             plan_context=_truncate(plan_context, 80000),
         )
-        raw = _call(prompt, f"reflect_{role[:8]}", timeout=240)
+        raw = _call(prompt, f"reflect_{role[:8]}", timeout=600)
         refined = _parse_reviewer_json(raw) if raw else None
         if refined:
             refined = _normalize_review_json(refined)
@@ -1929,7 +1929,7 @@ def _extract_number_table(sections: dict, cfg: dict) -> dict | None:
         expected_results=_truncate(sections.get("expected_results", ""), 2000),
         timeline=_truncate(sections.get("timeline", ""), 1000),
     )
-    raw = call_cli(prompt, cfg, timeout=120)
+    raw = call_cli(prompt, cfg, timeout=300)
     if not raw:
         log.warning("Number table extraction failed (no LLM response)")
         return None
@@ -2201,7 +2201,7 @@ def refine_research_plan(
         review_tagged=_truncate(review, 4000),
         number_table_text=number_table_text,
     )
-    planner_raw = _call(planner_prompt, "refine_planner", timeout=180)
+    planner_raw = _call(planner_prompt, "refine_planner", timeout=600)
 
     # Parse planner output
     revision_plan = []
@@ -2281,7 +2281,7 @@ def refine_research_plan(
             already_revised=already_revised_text or "(No other sections revised yet)",
             paper_context=paper_context_truncated,
         )
-        revised = _call(revise_prompt, f"revise_{section}", timeout=360)
+        revised = _call(revise_prompt, f"revise_{section}", timeout=600)
 
         if not revised or len(revised) < 100:
             log.warning("  Section revision failed for %s, keeping original", section)
@@ -2298,7 +2298,7 @@ def refine_research_plan(
             revised_content=revised,
             already_revised=already_revised_text or "(No other sections revised yet)",
         )
-        verify_raw = _call(verify_prompt, f"verify_{section}", timeout=120)
+        verify_raw = _call(verify_prompt, f"verify_{section}", timeout=300)
 
         if verify_raw:
             verify_json = _parse_reviewer_json(verify_raw)
@@ -2333,7 +2333,7 @@ def refine_research_plan(
         expected_results=_truncate(result.get("expected_results", ""), 1500),
         timeline=_truncate(result.get("timeline", ""), 1000),
     )
-    cross_raw = _call(cross_prompt, "cross_section_verify", timeout=180)
+    cross_raw = _call(cross_prompt, "cross_section_verify", timeout=600)
 
     if cross_raw:
         cross_json = _parse_reviewer_json(cross_raw)

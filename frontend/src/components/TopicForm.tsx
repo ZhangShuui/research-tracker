@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import { useRouter } from "next/navigation";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { X, ChevronDown, ChevronRight, Sparkles } from "lucide-react";
 import { api, Topic, TopicCreate } from "@/lib/api";
@@ -14,9 +15,11 @@ const DEFAULT_CATEGORIES = ["cs.CV", "cs.AI", "cs.LG"];
 
 export function TopicForm({ topic, onClose }: Props) {
   const qc = useQueryClient();
+  const router = useRouter();
   const isEdit = Boolean(topic);
 
   const [name, setName] = useState(topic?.name ?? "");
+  const [seedPapers, setSeedPapers] = useState("");
   const [description, setDescription] = useState(topic?.description ?? "");
   const [arxivKeywords, setArxivKeywords] = useState(
     (topic?.arxiv_keywords ?? []).join("\n")
@@ -66,12 +69,26 @@ export function TopicForm({ topic, onClose }: Props) {
   );
   const [error, setError] = useState("");
 
-  // Quick create (name only)
+  // Quick create (name → LLM config) + optional seed papers (best-effort)
   const quickCreateMut = useMutation({
-    mutationFn: (topicName: string) => api.quickCreateTopic(topicName),
-    onSuccess: () => {
+    mutationFn: async ({ topicName, seeds }: { topicName: string; seeds: string }) => {
+      const created = await api.quickCreateTopic(topicName);
+      let seeded = false;
+      if (seeds.trim()) {
+        seeded = true;
+        try {
+          await api.batchAddPapers(created.id, { text: seeds });
+        } catch {
+          // Topic is created regardless; seeding papers is best-effort.
+        }
+      }
+      return { created, seeded };
+    },
+    onSuccess: ({ created, seeded }) => {
       qc.invalidateQueries({ queryKey: ["topics"] });
       onClose();
+      // If papers were seeded, land on the new topic's library to show them.
+      if (seeded) router.push(`/topics/${created.id}/papers`);
     },
     onError: (e: Error) => setError(e.message),
   });
@@ -128,8 +145,8 @@ export function TopicForm({ topic, onClose }: Props) {
       };
       updateMut.mutate(body);
     } else {
-      // Quick create: just send the name
-      quickCreateMut.mutate(name.trim());
+      // Quick create: name (→ auto config) + optional seed papers
+      quickCreateMut.mutate({ topicName: name.trim(), seeds: seedPapers });
     }
   }
 
@@ -166,6 +183,21 @@ export function TopicForm({ topic, onClose }: Props) {
               Default: arXiv papers from the past year (up to 200 results).
               You can customize all settings later from the topic page.
             </p>
+
+            <div className="flex flex-col gap-1.5">
+              <label className="text-sm font-medium text-gray-700">
+                Add papers <span className="font-normal text-gray-400">(optional)</span>
+              </label>
+              <textarea
+                value={seedPapers}
+                onChange={(e) => setSeedPapers(e.target.value)}
+                placeholder="Paste arXiv URLs or IDs (comma or newline separated) to seed the library"
+                className="input h-20 resize-none font-mono text-xs"
+              />
+              <p className="text-xs text-slate-400">
+                arXiv links/IDs only — fetched and added when the topic is created.
+              </p>
+            </div>
 
             {error && (
               <p className="text-sm text-red-600 bg-red-50 rounded-lg p-3">

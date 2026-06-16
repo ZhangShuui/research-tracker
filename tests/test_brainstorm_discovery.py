@@ -111,9 +111,12 @@ class TestLoadDiscoveryContext:
 # ---------------------------------------------------------------
 
 class TestBrainstormDiscoveryInjection:
+    @patch("paper_tracker.brainstorm.search_by_query", return_value=[])
+    @patch("paper_tracker.brainstorm.call_copilot", return_value=None)
+    @patch("paper_tracker.brainstorm.call_codex", return_value=None)
     @patch("paper_tracker.brainstorm.call_cli")
     @patch("paper_tracker.brainstorm.Storage")
-    def test_auto_mode_includes_context(self, MockStorage, mock_cli, reg):
+    def test_auto_mode_includes_context(self, MockStorage, mock_cli, mock_codex, mock_copilot, mock_search, reg):
         """Auto brainstorm should include discovery context in the prompt."""
         # Set up discovery report
         dr = reg.create_discovery_report("trending")
@@ -151,9 +154,12 @@ class TestBrainstormDiscoveryInjection:
         assert "UNIQUE_TRENDING_MARKER_XYZ" in prompt
         assert "Discovery Context" in prompt
 
+    @patch("paper_tracker.brainstorm.search_by_query", return_value=[])
+    @patch("paper_tracker.brainstorm.call_copilot", return_value=None)
+    @patch("paper_tracker.brainstorm.call_codex", return_value=None)
     @patch("paper_tracker.brainstorm.call_cli")
     @patch("paper_tracker.brainstorm.Storage")
-    def test_no_registry_no_context(self, MockStorage, mock_cli):
+    def test_no_registry_no_context(self, MockStorage, mock_cli, mock_codex, mock_copilot, mock_search):
         """Without registry, brainstorm should still work (no context)."""
         mock_store = MagicMock()
         mock_store.get_all_arxiv.return_value = ([], 0)
@@ -183,9 +189,12 @@ class TestBrainstormDiscoveryInjection:
         # No discovery context markers
         assert "Discovery Context" not in prompt
 
+    @patch("paper_tracker.brainstorm.search_by_query", return_value=[])
+    @patch("paper_tracker.brainstorm.call_copilot", return_value=None)
+    @patch("paper_tracker.brainstorm.call_codex", return_value=None)
     @patch("paper_tracker.brainstorm.call_cli")
     @patch("paper_tracker.brainstorm.Storage")
-    def test_user_mode_not_affected(self, MockStorage, mock_cli, reg):
+    def test_user_mode_not_affected(self, MockStorage, mock_cli, mock_codex, mock_copilot, mock_search, reg):
         """User mode uses a different prompt — discovery context is only in auto mode."""
         dr = reg.create_discovery_report("trending")
         reg.update_discovery_report(dr["id"], {

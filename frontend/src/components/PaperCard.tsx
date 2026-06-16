@@ -8,18 +8,34 @@ interface Props {
   onClick: () => void;
   onDelete?: (arxivId: string) => void;
   onDeepRead?: (arxivId: string) => void;
+  selected?: boolean;
+  onToggleSelect?: (paper: Paper) => void;
 }
 
-export function PaperCard({ paper, onClick, onDelete, onDeepRead }: Props) {
+export function PaperCard({ paper, onClick, onDelete, onDeepRead, selected, onToggleSelect }: Props) {
   return (
     <div
       onClick={onClick}
-      className="bg-white rounded-xl border border-gray-200 p-4 hover:shadow-md transition-shadow cursor-pointer flex flex-col gap-2"
+      className={`bg-white rounded-xl border p-4 hover:shadow-md transition-shadow cursor-pointer flex flex-col gap-2 ${
+        selected ? "border-indigo-400 ring-2 ring-indigo-300" : "border-gray-200"
+      }`}
     >
       <div className="flex items-start justify-between gap-2">
-        <h3 className="font-medium text-sm text-gray-900 leading-snug line-clamp-2">
-          {paper.title}
-        </h3>
+        <div className="flex items-start gap-2 min-w-0">
+          {onToggleSelect && (
+            <input
+              type="checkbox"
+              checked={!!selected}
+              onClick={(e) => e.stopPropagation()}
+              onChange={() => onToggleSelect(paper)}
+              className="mt-0.5 shrink-0 rounded border-gray-300 cursor-pointer"
+              title="Select for insights"
+            />
+          )}
+          <h3 className="font-medium text-sm text-gray-900 leading-snug line-clamp-2">
+            {paper.title}
+          </h3>
+        </div>
         <div className="flex items-center gap-0.5 flex-shrink-0">
           {onDeepRead && (
             <button

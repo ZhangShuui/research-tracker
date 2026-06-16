@@ -335,6 +335,31 @@ class Storage:
         self._conn.commit()
         return cur.rowcount > 0
 
+    def update_arxiv_summary(self, arxiv_id: str, fields: dict) -> bool:
+        """Update descriptive fields for one paper (used after a manual add is
+        summarized). Only known columns are written; list fields are
+        JSON-encoded. Returns True if a row was updated."""
+        columns = {
+            "summary", "key_insight", "method", "contribution",
+            "math_concepts", "venue", "cited_works",
+        }
+        updates = {k: v for k, v in fields.items() if k in columns}
+        if not updates:
+            return False
+        sets, values = [], []
+        for k, v in updates.items():
+            sets.append(f"{k} = ?")
+            if k in ("math_concepts", "cited_works"):
+                values.append(json.dumps(v if v is not None else []))
+            else:
+                values.append(v if v is not None else "")
+        values.append(arxiv_id)
+        cur = self._conn.execute(
+            f"UPDATE seen_arxiv SET {', '.join(sets)} WHERE arxiv_id = ?", values
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
+
     def delete_arxiv_below_quality(self, min_quality: int) -> int:
         """Delete all papers with quality_score < min_quality. Returns count deleted."""
         cur = self._conn.execute(

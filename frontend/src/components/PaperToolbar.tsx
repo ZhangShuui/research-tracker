@@ -1,13 +1,19 @@
 "use client";
 
 import { useState } from "react";
-import { Search, LayoutGrid, List, SlidersHorizontal, Loader2 } from "lucide-react";
+import { Search, LayoutGrid, List, SlidersHorizontal, Loader2, Plus, Wand2 } from "lucide-react";
 
 interface RefilterStatus {
   status: string;
   total: number;
   processed: number;
   removed: number;
+}
+
+interface BackfillStatus {
+  status: string;
+  total: number;
+  processed: number;
 }
 
 interface Props {
@@ -21,8 +27,11 @@ interface Props {
   onDateToChange: (v: string) => void;
   view: "card" | "table";
   onViewChange: (v: "card" | "table") => void;
+  onAdd?: () => void;
   onRefilter?: (body: { custom_instructions: string; min_quality: number; auto_delete: boolean }) => void;
   refilterStatus?: RefilterStatus | null;
+  onBackfill?: () => void;
+  backfillStatus?: BackfillStatus | null;
 }
 
 export function PaperToolbar({
@@ -36,8 +45,11 @@ export function PaperToolbar({
   onDateToChange,
   view,
   onViewChange,
+  onAdd,
   onRefilter,
   refilterStatus,
+  onBackfill,
+  backfillStatus,
 }: Props) {
   const [showRefilter, setShowRefilter] = useState(false);
   const [instructions, setInstructions] = useState("");
@@ -45,6 +57,7 @@ export function PaperToolbar({
   const [autoDelete, setAutoDelete] = useState(false);
 
   const isRunning = refilterStatus?.status === "running";
+  const isBackfilling = backfillStatus?.status === "running";
 
   return (
     <div className="space-y-3 mb-4">
@@ -87,6 +100,26 @@ export function PaperToolbar({
           />
         </div>
         <div className="flex gap-2 self-start">
+          {onAdd && (
+            <button
+              onClick={onAdd}
+              className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg bg-indigo-600 text-white text-sm font-medium hover:bg-indigo-700 transition-colors"
+              title="Add a paper manually"
+            >
+              <Plus size={16} />
+              Add paper
+            </button>
+          )}
+          {onBackfill && (
+            <button
+              onClick={onBackfill}
+              disabled={isBackfilling}
+              className="p-2 rounded-lg border border-gray-300 hover:bg-gray-50 text-gray-500 disabled:opacity-50 transition-colors"
+              title="Summarize papers that are missing summaries"
+            >
+              {isBackfilling ? <Loader2 size={16} className="animate-spin" /> : <Wand2 size={16} />}
+            </button>
+          )}
           {onRefilter && (
             <button
               onClick={() => setShowRefilter(!showRefilter)}
@@ -126,6 +159,26 @@ export function PaperToolbar({
           </div>
         </div>
       </div>
+
+      {backfillStatus && backfillStatus.status !== "idle" && (
+        <div className={`text-xs px-3 py-2 rounded-lg ${
+          backfillStatus.status === "completed"
+            ? "bg-emerald-50 text-emerald-700"
+            : backfillStatus.status === "failed"
+            ? "bg-red-50 text-red-700"
+            : "bg-blue-50 text-blue-700"
+        }`}>
+          {backfillStatus.status === "running" && (
+            <>Summarizing missing summaries… {backfillStatus.processed}/{backfillStatus.total}</>
+          )}
+          {backfillStatus.status === "completed" && (
+            backfillStatus.total > 0
+              ? <>Summarized {backfillStatus.total} paper{backfillStatus.total === 1 ? "" : "s"}.</>
+              : <>All papers already have summaries.</>
+          )}
+          {backfillStatus.status === "failed" && <>Summary backfill failed. Please try again.</>}
+        </div>
+      )}
 
       {showRefilter && onRefilter && (
         <div className="bg-gray-50 rounded-xl border border-gray-200 p-4 space-y-3">

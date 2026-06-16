@@ -82,7 +82,7 @@ No markdown fences, no extra text.
 Repos:
 {items}"""
 
-_BATCH_SIZE = 20  # max items per CLI call to stay within context limits
+_BATCH_SIZE = 10  # halved (was 20): claude -p is non-streaming, so oversized batches generated >120s with no output and tripped the CLI timeout
 
 
 def _call_cli(prompt: str, cfg: dict) -> str | None:
@@ -249,10 +249,104 @@ def summarize_repos(repos: list[dict], cfg: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Early relevance prefilter (runs BEFORE summarize — only sees title+abstract)
+# ---------------------------------------------------------------------------
+
+_PREFILTER_BATCH_SIZE = 12  # halved (was 25): keep batch generation under the (non-streaming) CLI timeout
+
+_PREFILTER_PROMPT = """\
+You are screening papers for a research library on "{topic_name}".
+Description: {description}
+Keywords: {keywords}
+{criteria_section}
+For each paper below (title + abstract), answer: is this paper AT LEAST \
+plausibly about the topic above? Err on the side of keeping borderline \
+papers — a later pass will re-evaluate more carefully.
+
+Reply ONLY with a JSON array. Each object: \
+{{"id": str, "relevant": bool, "reason": str (<=12 words)}}. \
+No markdown fences, no extra text.
+
+Papers:
+{items}"""
+
+
+def prefilter_by_relevance(
+    papers: list[dict],
+    cfg: dict,
+    topic_name: str,
+    description: str = "",
+    criteria: str = "",
+    keywords: list[str] | None = None,
+    batch_size: int = _PREFILTER_BATCH_SIZE,
+) -> list[dict]:
+    """Drop papers whose title+abstract is clearly off-topic.
+
+    Runs BEFORE the expensive per-paper summarize step. Uses sonnet on
+    title+abstract only, batched. Papers that fail to be scored are kept
+    (benefit of doubt, matching filter_papers_by_quality).
+    """
+    from paper_tracker.llm import call_cli as llm_call_cli
+
+    if not papers:
+        return papers
+
+    kw_str = ", ".join(keywords) if keywords else topic_name
+    criteria_section = f"\nAdditional criteria: {criteria}\n" if criteria else ""
+
+    log.info("Prefiltering %d papers for topic '%s'", len(papers), topic_name)
+
+    kept: list[dict] = []
+    dropped: list[tuple[str, str]] = []  # (paper_id, reason) for logging
+
+    for batch_start in range(0, len(papers), batch_size):
+        batch = papers[batch_start : batch_start + batch_size]
+        items_text = "\n".join(
+            f"[{p.get('paper_id', p['arxiv_id'])}] {p['title']}\n"
+            f"  Abstract: {p.get('abstract', '')[:600]}"
+            for p in batch
+        )
+        prompt = _PREFILTER_PROMPT.format(
+            topic_name=topic_name,
+            description=description or topic_name,
+            keywords=kw_str,
+            criteria_section=criteria_section,
+            items=items_text,
+        )
+
+        raw = llm_call_cli(prompt, cfg, model="sonnet", timeout=600)
+        verdicts: dict[str, dict] = {}
+        if raw:
+            for entry in _parse_json_array(raw):
+                pid = str(entry.get("id", ""))
+                if pid:
+                    verdicts[pid] = entry
+
+        for p in batch:
+            pid = p.get("paper_id", p["arxiv_id"])
+            verdict = verdicts.get(pid)
+            if verdict is not None and verdict.get("relevant") is False:
+                dropped.append((pid, str(verdict.get("reason", ""))))
+            else:
+                kept.append(p)
+
+    removed = len(papers) - len(kept)
+    if removed:
+        log.info("Prefilter removed %d/%d papers (kept %d)",
+                 removed, len(papers), len(kept))
+        for pid, reason in dropped:
+            log.debug("  Prefiltered out: [%s] reason=%s", pid, reason)
+    else:
+        log.info("Prefilter: all %d papers passed", len(papers))
+
+    return kept
+
+
+# ---------------------------------------------------------------------------
 # Paper quality filtering
 # ---------------------------------------------------------------------------
 
-_QUALITY_FILTER_BATCH_SIZE = 10  # smaller batches for more attention per paper
+_QUALITY_FILTER_BATCH_SIZE = 5  # halved (was 10): smaller batches finish within the CLI timeout
 
 _QUALITY_FILTER_PROMPT = """\
 You are a senior ML researcher reviewing papers for a research survey on "{topic_name}".
@@ -325,7 +419,7 @@ def filter_papers_by_quality(
             topic_name=topic_name, keywords=kw_str, items=items_text
         )
 
-        raw = llm_call_cli(prompt, cfg, model="opus", timeout=180)
+        raw = llm_call_cli(prompt, cfg, model="opus", timeout=600)
         if raw:
             parsed = _parse_json_array(raw)
             lookup = {str(d.get("id", "")): d for d in parsed}
@@ -435,7 +529,7 @@ def refilter_papers(
             items=items_text,
         )
 
-        raw = llm_call_cli(prompt, cfg, model="opus", timeout=180)
+        raw = llm_call_cli(prompt, cfg, model="opus", timeout=600)
         if raw:
             parsed = _parse_json_array(raw)
             lookup = {str(d.get("id", "")): d for d in parsed}
